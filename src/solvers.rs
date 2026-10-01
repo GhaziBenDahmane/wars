@@ -46,6 +46,7 @@ re!(TOKEN_COUNT, r"(?i)(\d+) (\w+) tokens?");
 re!(TOKEN_NEGATION, r"(?i)\b(?:do not|don't|did not|didn't|never|not)\b");
 re!(TOKEN_GAIN, r"(?i)\b(?:take|takes|took|receive|receives|received|get|gets|got|gain|gains|find|finds|found|pick up|are given|win|wins|won|add)\b");
 re!(TOKEN_LOSS, r"(?i)\b(?:give away|gives away|gave away|give|gives|gave|lose|loses|lost|drop|drops|dropped|spend|spends|spent|remove|discard|return)\b");
+re!(RULES_TASK, r"(?i)^the same (?:hidden )?rules? transforms? (\w+) into what$");
 re!(NESTING, r"(?i)^the maximum nesting depth\b(.*)$");
 re!(FIRST_REACHED, r"(?i)^(?: \(.*?\))?,? then the position of the bracket where that depth is first reached, counting from 1$");
 
@@ -323,6 +324,78 @@ fn tokens(start: &str, colour: Option<&str>) -> Option<String> {
     }
 }
 
+fn substrings(words: &[&str], lengths: std::ops::RangeInclusive<usize>) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for word in words {
+        let chars: Vec<char> = word.chars().collect();
+        for len in lengths.clone() {
+            for start in 0..=chars.len().saturating_sub(len) {
+                if start + len <= chars.len() {
+                    let piece: String = chars[start..start + len].iter().collect();
+                    if !found.contains(&piece) {
+                        found.push(piece);
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Find up to two ordered `replace(lhs, rhs)` rules that turn every example
+/// input into its output, and apply them to `query`. Among the smallest rule
+/// sets that fit, the most common answer wins.
+fn hidden_rules(examples: &str, query: &str) -> Option<String> {
+    let pairs: Vec<(String, String)> = examples
+        .split(';')
+        .filter_map(|pair| {
+            let (from, to) = pair.split_once("->")?;
+            Some((from.trim().to_string(), to.trim().to_string()))
+        })
+        .collect();
+    if pairs.is_empty() || pairs.iter().any(|(a, b)| a.is_empty() || b.contains(char::is_whitespace)) {
+        return None;
+    }
+    let outputs: Vec<&str> = pairs.iter().map(|(_, b)| b.as_str()).collect();
+    let rhs = substrings(&outputs, 0..=3);
+    let mut answers: HashMap<String, usize> = HashMap::new();
+    let fits = |mids: &[String]| pairs.iter().zip(mids).all(|((_, out), mid)| mid == out);
+
+    // One rule.
+    let inputs: Vec<&str> = pairs.iter().map(|(a, _)| a.as_str()).collect();
+    for lhs in substrings(&inputs, 1..=3) {
+        for r in rhs.iter().filter(|r| **r != lhs) {
+            let mids: Vec<String> = pairs.iter().map(|(a, _)| a.replace(&lhs, r)).collect();
+            if fits(&mids) {
+                *answers.entry(query.replace(&lhs, r)).or_default() += 1;
+            }
+        }
+    }
+    if answers.is_empty() {
+        // Two rules, applied in order.
+        for lhs1 in substrings(&inputs, 1..=2) {
+            for r1 in rhs.iter().filter(|r| **r != lhs1) {
+                let mids: Vec<String> = pairs.iter().map(|(a, _)| a.replace(&lhs1, r1)).collect();
+                let mid_refs: Vec<&str> = mids.iter().map(String::as_str).collect();
+                for lhs2 in substrings(&mid_refs, 1..=3) {
+                    for r2 in rhs.iter().filter(|r| **r != lhs2) {
+                        let ok = pairs.iter().zip(&mids).all(|((_, out), mid)| {
+                            let n = mid.matches(lhs2.as_str()).count();
+                            let len = mid.len() + n * r2.len() - n * lhs2.len();
+                            len == out.len() && mid.replace(&lhs2, r2) == *out
+                        });
+                        if ok {
+                            let answer = query.replace(&lhs1, r1).replace(&lhs2, r2);
+                            *answers.entry(answer).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    answers.into_iter().max_by_key(|(_, n)| *n).map(|(answer, _)| answer)
+}
+
 fn final_position(prompt: &str, parts: &HashMap<&str, &str>) -> Option<String> {
     let start = START_AT.captures(prompt)?;
     let moves = MOVES.captures(parts.get("MOVES")?)?;
@@ -372,6 +445,10 @@ pub fn solve(prompt: &str) -> Option<String> {
     if let (Some(m), Some(start)) = (TOKENS_TASK.captures(task), parts.get("START")) {
         let colour = m.get(1).map(|c| c.as_str()).filter(|c| !c.eq_ignore_ascii_case("total"));
         return tokens(start, colour);
+    }
+
+    if let (Some(m), Some(examples)) = (RULES_TASK.captures(task), parts.get("EXAMPLES")) {
+        return hidden_rules(examples, &m[1]);
     }
 
     if let Some(m) = GRID_TASK.captures(task) {
@@ -499,6 +576,17 @@ mod tests {
         assert_eq!(solve(&prompt.replace("how many red", "how many blue")).as_deref(), Some("4"));
         assert_eq!(solve(&prompt.replace("You take 3", "You give away 3")).as_deref(), Some("4"));
         assert_eq!(solve(&prompt.replace("You take 3", "You juggle 3")), None);
+    }
+
+    #[test]
+    fn hidden_rewrite_rules() {
+        let prompt = "EXAMPLES: adac -> ycdyg ; aac -> ycyg ; aaac -> ycycyg ; bbb -> bbb | TASK: the same \
+                      hidden rules transform ddac into what | Correct answer: AUH. | ANSWER: letters only, no spaces";
+        let started = std::time::Instant::now();
+        assert_eq!(solve(prompt).as_deref(), Some("ddyg"));
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "{:?}", started.elapsed());
+        let one = "EXAMPLES: abc -> xbc ; aa -> xx ; b -> b | TASK: the same hidden rules transform cab into what";
+        assert_eq!(solve(one).as_deref(), Some("cxb"));
     }
 
     #[test]
