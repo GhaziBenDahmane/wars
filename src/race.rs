@@ -194,8 +194,18 @@ pub async fn race(session: &Session, config: &Config, turnstile_token: &str, llm
                 "drillId": drill["id"],
                 "submission": submission,
             });
-            let (response, sent) =
-                rpc::hedged(&session.routes, "submitAnswerV2", &input, config.hedge_after, config.max_requests).await?;
+            let hedged = rpc::hedged(&session.routes, "submitAnswerV2", &input, config.hedge_after, config.max_requests);
+            let (response, sent) = match hedged.await {
+                Ok(reply) => reply,
+                // Too late: the run is over but its score can still be saved.
+                Err(error) if error.downcast_ref::<RpcError>().is_some_and(|e| e.status == 409) => {
+                    crate::say!("[{}] {error:#} ({source} answer {submission:?} for: {prompt})", answered + 1);
+                    log.write("answer", json!({ "index": answered, "drill": drill, "submission": submission,
+                                                "source": source, "error": error.to_string() }));
+                    break format!("{error:#}");
+                }
+                Err(error) => return Err(error),
+            };
             received = Instant::now();
             let round_trip = received - solved;
             rtt = (rtt * 7 + round_trip * 3) / 10;

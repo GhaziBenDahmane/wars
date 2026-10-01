@@ -39,6 +39,8 @@ re!(CLAUSE_PREFIX, r"(?i)^(?:and then|then|and)\s+");
 re!(MOD_WORD, r"(?i)\bmod(?:ulo)?\b");
 re!(ARITHMETIC_CHARS, r"^[\d\s+\-*/%()]+$");
 re!(ODD_ONE, r"(?i)^exactly one character is (?:a |an )?(digit|number|lower ?case letter|upper ?case letter|vowel|consonant|letter|symbol|punctuation mark|space)s?,? (?:give|what is|return|find) its position,? counting from (1|0)$");
+re!(GRID_TASK, r"(?i)^(rotate the grid 90 degrees clockwise|rotate the grid 90 degrees (?:counter-?clockwise|anti-?clockwise)|rotate the grid 180 degrees|transpose the grid|flip the grid (?:horizontally|left to right)|flip the grid (?:vertically|upside down)),? then read the (?:\w+ )?rows left to right$");
+re!(GRID_ROWS, r"(?:^|\|)\s*GRID[^:|]*:\s*([^|]+)");
 re!(NESTING, r"(?i)^the maximum nesting depth\b(.*)$");
 re!(FIRST_REACHED, r"(?i)^(?: \(.*?\))?,? then the position of the bracket where that depth is first reached, counting from 1$");
 
@@ -257,6 +259,32 @@ fn nesting(brackets: &str, with_position: bool) -> Option<String> {
     Some(if with_position { format!("{best},{at}") } else { best.to_string() })
 }
 
+/// The grid after the transform, rows concatenated. Only square grids.
+fn grid(rows: &str, transform: &str) -> Option<String> {
+    let rows: Vec<Vec<char>> = rows.split('/').map(|r| r.trim().chars().collect()).collect();
+    let n = rows.len();
+    if n == 0 || rows.iter().any(|r| r.len() != n) {
+        return None;
+    }
+    let transform = transform.to_lowercase();
+    let cell = |r: usize, c: usize| -> char {
+        if transform.contains("180") {
+            rows[n - 1 - r][n - 1 - c]
+        } else if transform.contains("counter") || transform.contains("anti") {
+            rows[c][n - 1 - r]
+        } else if transform.contains("clockwise") {
+            rows[n - 1 - c][r]
+        } else if transform.contains("transpose") {
+            rows[c][r]
+        } else if transform.contains("horizontal") || transform.contains("left to right") {
+            rows[r][n - 1 - c]
+        } else {
+            rows[n - 1 - r][c]
+        }
+    };
+    Some((0..n).flat_map(|r| (0..n).map(move |c| (r, c))).map(|(r, c)| cell(r, c)).collect())
+}
+
 fn final_position(prompt: &str, parts: &HashMap<&str, &str>) -> Option<String> {
     let start = START_AT.captures(prompt)?;
     let moves = MOVES.captures(parts.get("MOVES")?)?;
@@ -301,6 +329,11 @@ pub fn solve(prompt: &str) -> Option<String> {
         let found: Vec<usize> = data.chars().enumerate().filter(|&(_, c)| wanted(c)).map(|(i, _)| i).collect();
         let base: usize = m[2].parse().ok()?;
         return (found.len() == 1).then(|| (found[0] + base).to_string());
+    }
+
+    if let Some(m) = GRID_TASK.captures(task) {
+        // The label carries a note ("GRID (three rows)"), so it is not in `parts`.
+        return grid(GRID_ROWS.captures(prompt)?.get(1)?.as_str(), &m[1]);
     }
 
     if let (Some(m), Some(brackets)) = (NESTING.captures(task), parts.get("BRACKETS")) {
@@ -412,6 +445,18 @@ mod tests {
         let prompt = "WORDS: FIKUF JEFALAD MEJPE RASZAKAX | TASK: take word number 3, counting \
                       from 1, write it backwards, drop every vowel (AEIOU) | ANSWER: letters only";
         assert_eq!(solve(prompt).as_deref(), Some("PJM"));
+    }
+
+    #[test]
+    fn grid_transforms() {
+        let p = |task: &str| format!("Correct answer: SBM. | GRID (three rows): OLZ / YGX / JXS | TASK: {task}, \
+                                      then read the three rows left to right | ANSWER: 9 letters, no separators");
+        assert_eq!(solve(&p("rotate the grid 90 degrees clockwise")).as_deref(), Some("JYOXGLSXZ"));
+        assert_eq!(solve(&p("rotate the grid 90 degrees counterclockwise")).as_deref(), Some("ZXSLGXOYJ"));
+        assert_eq!(solve(&p("rotate the grid 180 degrees")).as_deref(), Some("SXJXGYZLO"));
+        assert_eq!(solve(&p("transpose the grid")).as_deref(), Some("OYJLGXZXS"));
+        assert_eq!(solve(&p("flip the grid horizontally")).as_deref(), Some("ZLOXGYSXJ"));
+        assert_eq!(solve(&p("flip the grid vertically")).as_deref(), Some("JXSYGXOLZ"));
     }
 
     #[test]
