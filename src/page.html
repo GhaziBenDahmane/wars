@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agents War</title>
+<style>
+  body { font: 15px system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.4rem; }
+  .row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; margin: 1rem 0; }
+  input { padding: .5rem; font: inherit; width: 16rem; }
+  button { padding: .55rem 1.1rem; font: inherit; border: 1px solid #888; border-radius: 6px; background: #f4f4f4; cursor: pointer; }
+  button.race { background: #c62828; border-color: #c62828; color: #fff; font-weight: 600; }
+  button:disabled { opacity: .45; cursor: default; }
+  pre { background: #111; color: #ddd; padding: 1rem; border-radius: 6px; min-height: 12rem; white-space: pre-wrap; word-break: break-word; }
+  #config, #state { color: #555; }
+</style>
+</head>
+<body>
+<h1>Agents War</h1>
+<div id="config">loading…</div>
+<div class="row">
+  <input id="token" type="password" placeholder="run token" autocomplete="current-password">
+  <button data-job="bench">Bench</button>
+  <button data-job="dry-run">Dry run</button>
+  <button data-job="race" class="race">Race</button>
+</div>
+<div id="state"></div>
+<pre id="output"></pre>
+<script>
+const token = document.getElementById('token');
+token.value = localStorage.getItem('runToken') || '';
+token.oninput = () => localStorage.setItem('runToken', token.value);
+const buttons = [...document.querySelectorAll('button[data-job]')];
+
+for (const button of buttons) {
+  button.onclick = async () => {
+    const job = button.dataset.job;
+    if (job === 'race' && !confirm('Start a race? This spends one attempt.')) return;
+    const response = await fetch('/run/' + job, { method: 'POST', headers: { 'x-run-token': token.value } });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) alert(body.message || response.status);
+    refresh();
+  };
+}
+
+async function refresh() {
+  const status = await (await fetch('/status')).json();
+  const c = status.config;
+  document.getElementById('config').textContent =
+    `${c.url} | email ${c.email ? 'set' : 'MISSING'} | nickname ${c.nickname || 'none (score not submitted)'} | hedge ${c.hedge_ms} ms`
+    + (c.buttons ? '' : ' | QUIZ_SC_RUN_TOKEN not set: buttons disabled');
+  for (const button of buttons) button.disabled = !c.buttons || !!status.running;
+  const last = status.last;
+  document.getElementById('state').textContent = status.running
+    ? `running: ${status.running}…`
+    : last ? `${last.job}: ${last.ok ? 'done' : 'failed'}` : 'idle';
+  document.getElementById('output').textContent = status.lines.join('\n');
+}
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
