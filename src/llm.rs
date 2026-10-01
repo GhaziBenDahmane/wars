@@ -44,7 +44,7 @@ impl Llm {
                 { "role": "system", "content": SYSTEM_PROMPT },
                 { "role": "user", "content": prompt },
             ],
-            "reasoning_effort": "none",
+            "stream": false,
             "max_completion_tokens": 200,
         });
         let response = self.client.post(&self.url).json(&body).send().await.context("LLM request")?;

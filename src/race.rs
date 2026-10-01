@@ -14,6 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Margin kept between an LLM fallback and the question deadline.
 const SAFETY: Duration = Duration::from_millis(250);
+/// Time an LLM fallback always gets, even past the deadline: the alternative
+/// is "?", which is wrong anyway, so a late answer can only help.
+const LLM_FLOOR: Duration = Duration::from_secs(4);
 
 pub struct Config {
     pub code: String,
@@ -142,7 +145,7 @@ async fn answer(llm: Option<&Llm>, prompt: &str, budget: Duration) -> (String, &
         return (answer, "exact");
     }
     if let Some(llm) = llm
-        && let Ok(Ok(answer)) = tokio::time::timeout(budget, llm.answer(prompt)).await {
+        && let Ok(Ok(answer)) = tokio::time::timeout(budget.max(LLM_FLOOR), llm.answer(prompt)).await {
             return (answer, "llm");
         }
     ("?".into(), "none")
