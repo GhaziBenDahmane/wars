@@ -211,7 +211,10 @@ pub async fn race(session: &Session, config: &Config, turnstile_token: &str, llm
                 "response": response,
             }));
             summary.push((source, solved - thought, round_trip, correct));
-            if !correct {
+            if source != "exact" {
+                crate::say!("[{}] UNKNOWN ({source}, {}) answered {submission:?} for: {prompt}",
+                    answered + 1, if correct { "right" } else { "wrong" });
+            } else if !correct {
                 crate::say!("[{}] WRONG {submission:?} for: {prompt}", answered + 1);
             }
             if !correct || response.get("ended").is_some_and(|e| !e.is_null()) {
