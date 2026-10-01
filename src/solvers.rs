@@ -41,6 +41,11 @@ re!(ARITHMETIC_CHARS, r"^[\d\s+\-*/%()]+$");
 re!(ODD_ONE, r"(?i)^exactly one character is (?:a |an )?(digit|number|lower ?case letter|upper ?case letter|vowel|consonant|letter|symbol|punctuation mark|space)s?,? (?:give|what is|return|find) its position,? counting from (1|0)$");
 re!(GRID_TASK, r"(?i)^(rotate the grid 90 degrees clockwise|rotate the grid 90 degrees (?:counter-?clockwise|anti-?clockwise)|rotate the grid 180 degrees|transpose the grid|flip the grid (?:horizontally|left to right)|flip the grid (?:vertically|upside down)),? then read the (?:\w+ )?rows left to right$");
 re!(GRID_ROWS, r"(?:^|\|)\s*GRID[^:|]*:\s*([^|]+)");
+re!(TOKENS_TASK, r"(?i)^how many (?:(\w+) )?tokens do you (?:hold|have)(?: at the end| in total| now)*$");
+re!(TOKEN_COUNT, r"(?i)(\d+) (\w+) tokens?");
+re!(TOKEN_NEGATION, r"(?i)\b(?:do not|don't|did not|didn't|never|not)\b");
+re!(TOKEN_GAIN, r"(?i)\b(?:take|takes|took|receive|receives|received|get|gets|got|gain|gains|find|finds|found|pick up|are given|win|wins|won|add)\b");
+re!(TOKEN_LOSS, r"(?i)\b(?:give away|gives away|gave away|give|gives|gave|lose|loses|lost|drop|drops|dropped|spend|spends|spent|remove|discard|return)\b");
 re!(NESTING, r"(?i)^the maximum nesting depth\b(.*)$");
 re!(FIRST_REACHED, r"(?i)^(?: \(.*?\))?,? then the position of the bracket where that depth is first reached, counting from 1$");
 
@@ -285,6 +290,39 @@ fn grid(rows: &str, transform: &str) -> Option<String> {
     Some((0..n).flat_map(|r| (0..n).map(move |c| (r, c))).map(|(r, c)| cell(r, c)).collect())
 }
 
+/// Token bookkeeping: "you hold 7 red tokens ... You do NOT take 1 blue token.
+/// You take 3 red tokens." Negated sentences change nothing.
+fn tokens(start: &str, colour: Option<&str>) -> Option<String> {
+    let mut sentences = start.split(['.', ';']).map(str::trim).filter(|s| !s.is_empty());
+    let mut held: HashMap<String, i64> = HashMap::new();
+    for m in TOKEN_COUNT.captures_iter(sentences.next()?) {
+        held.insert(m[2].to_lowercase(), m[1].parse().ok()?);
+    }
+    if held.is_empty() {
+        return None;
+    }
+    for sentence in sentences {
+        let m = TOKEN_COUNT.captures(sentence)?;
+        if TOKEN_COUNT.captures_iter(sentence).count() != 1 {
+            return None;
+        }
+        if TOKEN_NEGATION.is_match(sentence) {
+            continue;
+        }
+        let amount: i64 = m[1].parse().ok()?;
+        let delta = match (TOKEN_LOSS.is_match(sentence), TOKEN_GAIN.is_match(sentence)) {
+            (true, _) => -amount,
+            (false, true) => amount,
+            _ => return None,
+        };
+        *held.entry(m[2].to_lowercase()).or_insert(0) += delta;
+    }
+    match colour {
+        Some(colour) => held.get(&colour.to_lowercase()).map(|n| n.to_string()),
+        None => Some(held.values().sum::<i64>().to_string()),
+    }
+}
+
 fn final_position(prompt: &str, parts: &HashMap<&str, &str>) -> Option<String> {
     let start = START_AT.captures(prompt)?;
     let moves = MOVES.captures(parts.get("MOVES")?)?;
@@ -329,6 +367,11 @@ pub fn solve(prompt: &str) -> Option<String> {
         let found: Vec<usize> = data.chars().enumerate().filter(|&(_, c)| wanted(c)).map(|(i, _)| i).collect();
         let base: usize = m[2].parse().ok()?;
         return (found.len() == 1).then(|| (found[0] + base).to_string());
+    }
+
+    if let (Some(m), Some(start)) = (TOKENS_TASK.captures(task), parts.get("START")) {
+        let colour = m.get(1).map(|c| c.as_str()).filter(|c| !c.eq_ignore_ascii_case("total"));
+        return tokens(start, colour);
     }
 
     if let Some(m) = GRID_TASK.captures(task) {
@@ -445,6 +488,17 @@ mod tests {
         let prompt = "WORDS: FIKUF JEFALAD MEJPE RASZAKAX | TASK: take word number 3, counting \
                       from 1, write it backwards, drop every vowel (AEIOU) | ANSWER: letters only";
         assert_eq!(solve(prompt).as_deref(), Some("PJM"));
+    }
+
+    #[test]
+    fn token_bookkeeping_ignores_negated_moves() {
+        let prompt = "Correct answer: QYG. | START: you hold 7 red tokens and 4 blue tokens. You do NOT take 1 \
+                      blue token. You do NOT give away 2 blue tokens. You take 3 red tokens. | TASK: how many red \
+                      tokens do you hold at the end | ANSWER: digits only";
+        assert_eq!(solve(prompt).as_deref(), Some("10"));
+        assert_eq!(solve(&prompt.replace("how many red", "how many blue")).as_deref(), Some("4"));
+        assert_eq!(solve(&prompt.replace("You take 3", "You give away 3")).as_deref(), Some("4"));
+        assert_eq!(solve(&prompt.replace("You take 3", "You juggle 3")), None);
     }
 
     #[test]
