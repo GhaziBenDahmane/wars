@@ -38,6 +38,7 @@ re!(CLAUSE_SPLIT, r",\s*");
 re!(CLAUSE_PREFIX, r"(?i)^(?:and then|then|and)\s+");
 re!(MOD_WORD, r"(?i)\bmod(?:ulo)?\b");
 re!(ARITHMETIC_CHARS, r"^[\d\s+\-*/%()]+$");
+re!(ODD_ONE, r"(?i)^exactly one character is (?:a |an )?(digit|number|lower ?case letter|upper ?case letter|vowel|consonant|letter|symbol|punctuation mark|space)s?,? (?:give|what is|return|find) its position,? counting from (1|0)$");
 re!(NESTING, r"(?i)^the maximum nesting depth\b(.*)$");
 re!(FIRST_REACHED, r"(?i)^(?: \(.*?\))?,? then the position of the bracket where that depth is first reached, counting from 1$");
 
@@ -285,6 +286,23 @@ pub fn solve(prompt: &str) -> Option<String> {
         return final_position(prompt, &parts);
     }
 
+    if let (Some(m), Some(data)) = (ODD_ONE.captures(task), data) {
+        let kind = m[1].to_lowercase().replace(' ', "");
+        let wanted = |c: char| match kind.as_str() {
+            "digit" | "number" => c.is_ascii_digit(),
+            "lowercaseletter" => c.is_lowercase(),
+            "uppercaseletter" => c.is_uppercase(),
+            "vowel" => is_vowel(c),
+            "consonant" => c.is_alphabetic() && !is_vowel(c),
+            "letter" => c.is_alphabetic(),
+            "space" => c == ' ',
+            _ => !c.is_alphanumeric() && !c.is_whitespace(),
+        };
+        let found: Vec<usize> = data.chars().enumerate().filter(|&(_, c)| wanted(c)).map(|(i, _)| i).collect();
+        let base: usize = m[2].parse().ok()?;
+        return (found.len() == 1).then(|| (found[0] + base).to_string());
+    }
+
     if let (Some(m), Some(brackets)) = (NESTING.captures(task), parts.get("BRACKETS")) {
         let rest = m[1].trim();
         if rest.is_empty() || rest.starts_with('(') && !rest.contains("then") {
@@ -394,6 +412,19 @@ mod tests {
         let prompt = "WORDS: FIKUF JEFALAD MEJPE RASZAKAX | TASK: take word number 3, counting \
                       from 1, write it backwards, drop every vowel (AEIOU) | ANSWER: letters only";
         assert_eq!(solve(prompt).as_deref(), Some("PJM"));
+    }
+
+    #[test]
+    fn the_one_odd_character() {
+        let prompt = "Correct answer: WLP. | TEXT: TLUCKVAHFDC1RHUS | TASK: exactly one character is a digit, \
+                      give its position, counting from 1 | ANSWER: digits only";
+        assert_eq!(solve(prompt).as_deref(), Some("12"));
+        assert_eq!(solve(&prompt.replace("C1R", "C1R2")), None);
+        assert_eq!(
+            solve("TEXT: ABcD | TASK: exactly one character is a lowercase letter, give its position, counting from 1")
+                .as_deref(),
+            Some("3")
+        );
     }
 
     #[test]
