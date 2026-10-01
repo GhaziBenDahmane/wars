@@ -38,6 +38,8 @@ re!(CLAUSE_SPLIT, r",\s*");
 re!(CLAUSE_PREFIX, r"(?i)^(?:and then|then|and)\s+");
 re!(MOD_WORD, r"(?i)\bmod(?:ulo)?\b");
 re!(ARITHMETIC_CHARS, r"^[\d\s+\-*/%()]+$");
+re!(NESTING, r"(?i)^the maximum nesting depth\b(.*)$");
+re!(FIRST_REACHED, r"(?i)^(?: \(.*?\))?,? then the position of the bracket where that depth is first reached, counting from 1$");
 
 pub fn segments(prompt: &str) -> HashMap<&str, &str> {
     let mut found = HashMap::new();
@@ -233,6 +235,27 @@ fn pipeline(word: &str, rest: &str) -> Option<String> {
     Some(word)
 }
 
+/// `depth` or `depth,position` (1-based) of the first bracket at that depth.
+fn nesting(brackets: &str, with_position: bool) -> Option<String> {
+    let (mut depth, mut best, mut at) = (0usize, 0usize, 0usize);
+    for (index, c) in brackets.chars().filter(|c| !c.is_whitespace()).enumerate() {
+        match c {
+            '(' | '[' | '{' => {
+                depth += 1;
+                if depth > best {
+                    (best, at) = (depth, index + 1);
+                }
+            }
+            ')' | ']' | '}' => depth = depth.checked_sub(1)?,
+            _ => return None,
+        }
+    }
+    if depth != 0 || best == 0 {
+        return None;
+    }
+    Some(if with_position { format!("{best},{at}") } else { best.to_string() })
+}
+
 fn final_position(prompt: &str, parts: &HashMap<&str, &str>) -> Option<String> {
     let start = START_AT.captures(prompt)?;
     let moves = MOVES.captures(parts.get("MOVES")?)?;
@@ -260,6 +283,14 @@ pub fn solve(prompt: &str) -> Option<String> {
 
     if FINAL_POSITION.is_match(task) {
         return final_position(prompt, &parts);
+    }
+
+    if let (Some(m), Some(brackets)) = (NESTING.captures(task), parts.get("BRACKETS")) {
+        let rest = m[1].trim();
+        if rest.is_empty() || rest.starts_with('(') && !rest.contains("then") {
+            return nesting(brackets, false);
+        }
+        return FIRST_REACHED.is_match(&m[1]).then(|| nesting(brackets, true))?;
     }
 
     if let Some(m) = COMPUTE.captures(task) {
@@ -363,6 +394,16 @@ mod tests {
         let prompt = "WORDS: FIKUF JEFALAD MEJPE RASZAKAX | TASK: take word number 3, counting \
                       from 1, write it backwards, drop every vowel (AEIOU) | ANSWER: letters only";
         assert_eq!(solve(prompt).as_deref(), Some("PJM"));
+    }
+
+    #[test]
+    fn nesting_depth_and_where_it_is_first_reached() {
+        let prompt = "BRACKETS: (()())()()()()((()())()()) | TASK: the maximum nesting depth (the outermost \
+                      bracket counts as depth 1), then the position of the bracket where that depth is first \
+                      reached, counting from 1 | Correct answer: GJA. | ANSWER: two numbers separated by a comma";
+        assert_eq!(solve(prompt).as_deref(), Some("3,17"));
+        assert_eq!(solve("BRACKETS: (()) | TASK: the maximum nesting depth | ANSWER: digits").as_deref(), Some("2"));
+        assert_eq!(solve("BRACKETS: (() | TASK: the maximum nesting depth | ANSWER: digits"), None);
     }
 
     #[test]
