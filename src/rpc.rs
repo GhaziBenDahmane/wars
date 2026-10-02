@@ -98,6 +98,9 @@ impl Rpc {
 /// costs the 2 s deadline. The server dedupes a repeated answer (`isReplay`),
 /// so a duplicate goes out on the next route whenever the in-flight ones are
 /// slower than `hedge_after` (or failed), and the first response wins.
+/// Wait before resending after a 429 when nothing else is in flight.
+const THROTTLE_PAUSE: Duration = Duration::from_millis(100);
+
 pub async fn hedged(
     routes: &[Rpc],
     procedure: &str,
@@ -109,8 +112,13 @@ pub async fn hedged(
     let mut in_flight = FuturesUnordered::new();
     let mut sent = 0;
     let mut last_error = None;
+    // Set by a 429: no more duplicates, and the requests still in flight decide.
+    let mut throttled = false;
     loop {
-        if sent < max_requests {
+        if sent < max_requests && (!throttled || in_flight.is_empty()) {
+            if throttled {
+                tokio::time::sleep(THROTTLE_PAUSE).await;
+            }
             let route = routes[sent % routes.len()].clone();
             let body = body.clone();
             let procedure = procedure.to_string();
@@ -119,7 +127,7 @@ pub async fn hedged(
         } else if in_flight.is_empty() {
             return Err(last_error.unwrap_or_else(|| anyhow!("{procedure}: no route answered")));
         }
-        let next = if sent < max_requests {
+        let next = if sent < max_requests && !throttled {
             match tokio::time::timeout(hedge_after, in_flight.next()).await {
                 Ok(next) => next,
                 Err(_) => continue, // slow: send a duplicate
@@ -129,6 +137,10 @@ pub async fn hedged(
         };
         match next {
             Some(Ok(value)) => return Ok((value, sent)),
+            Some(Err(error)) if error.downcast_ref::<RpcError>().is_some_and(|e| e.status == 429) => {
+                throttled = true;
+                last_error = Some(error);
+            }
             Some(Err(error)) if error.downcast_ref::<RpcError>().is_some() => return Err(error),
             Some(Err(error)) => last_error = Some(error), // transport failure: next route now
             None => {}
@@ -206,5 +218,16 @@ mod tests {
             .unwrap();
         assert_eq!(sent, 3);
         assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_429_stops_the_duplicates_and_retries_alone() {
+        let (origin, count) = server(vec![0, 0, 0, 0], 429, r#"{"json":{"message":"Too Many Requests"}}"#).await;
+        let route = Rpc::with_origin(&origin, "test", None).unwrap();
+        let started = std::time::Instant::now();
+        let result = hedged(&[route.clone(), route], "p", &json!({}), Duration::from_millis(5), 3).await;
+        assert!(result.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        assert!(started.elapsed() >= THROTTLE_PAUSE * 2, "{:?}", started.elapsed());
     }
 }
