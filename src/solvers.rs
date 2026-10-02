@@ -44,7 +44,7 @@ re!(GRID_ROWS, r"(?:^|\|)\s*GRID[^:|]*:\s*([^|]+)");
 re!(TOKENS_TASK, r"(?i)^how many (?:(\w+) )?tokens do you (?:hold|have)(?: at the end| in total| now)*$");
 re!(TOKEN_COUNT, r"(?i)(\d+) (\w+) tokens?");
 re!(TOKEN_NONE, r"(?i)\b(?:no|zero) \w+ tokens?\b");
-re!(TOKEN_NEGATION, r"(?i)\b(?:do not|don't|did not|didn't|never|not)\b");
+re!(TOKEN_NEGATION, r"(?i)\b(?:do not|don't|did not|didn't|never|not|except|ignore|skip|cancel(?:l?ed)?|imagine|pretend)\b");
 re!(TOKEN_GAIN, r"(?i)\b(?:take|takes|took|receive|receives|received|get|gets|got|gain|gains|find|finds|found|pick up|are given|win|wins|won|add)\b");
 re!(TOKEN_LOSS, r"(?i)\b(?:give away|gives away|gave away|give|gives|gave|lose|loses|lost|drop|drops|dropped|spend|spends|spent|remove|discard|return)\b");
 re!(RULES_TASK, r"(?i)^the same (?:hidden )?rules? transforms? (\w+) into what$");
@@ -570,6 +570,15 @@ mod tests {
         let prompt = "WORDS: FIKUF JEFALAD MEJPE RASZAKAX | TASK: take word number 3, counting \
                       from 1, write it backwards, drop every vowel (AEIOU) | ANSWER: letters only";
         assert_eq!(solve(prompt).as_deref(), Some("PJM"));
+    }
+
+    #[test]
+    fn token_bookkeeping_skips_the_excepted_move() {
+        let prompt = "Correct answer: TNX. | START: you hold 3 red tokens and 5 blue tokens. You do NOT take 2 red \
+                      tokens. You give away 3 blue tokens. Everything happens except this: you take 3 blue tokens. \
+                      You give away 1 red token. | TASK: how many blue tokens do you hold at the end | ANSWER: digits only";
+        assert_eq!(solve(prompt).as_deref(), Some("2"));
+        assert_eq!(solve(&prompt.replace("many blue", "many red")).as_deref(), Some("2"));
     }
 
     #[test]
