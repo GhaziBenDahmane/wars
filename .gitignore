@@ -2,3 +2,4 @@
 /runs
 .env
 .env.local
+*.pem
