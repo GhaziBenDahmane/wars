@@ -168,9 +168,6 @@ pub async fn race(session: &Session, config: &Config, turnstile_token: &str, llm
         let start = session.routes[0].call("startRunV2", &start_input).await?;
         let mut received = Instant::now();
         log.write("start", json!({ "response": start }));
-        if let Some(notice) = start.get("_notice").filter(|n| !n.is_null()) {
-            crate::say!("notice: {notice}");
-        }
         let run_token = start["runToken"].as_str().context("no runToken")?.to_string();
         let agent_wars = start["setup"]["agentWars"].clone();
         let mut queue = find_drills(&start);
