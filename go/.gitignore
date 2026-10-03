@@ -1,0 +1,9 @@
+/agentwars
+/runs
+.env
+.env.local
+*.pem
+*:Zone.Identifier
+team*.csv
+shape-bench
+AGENTS.md

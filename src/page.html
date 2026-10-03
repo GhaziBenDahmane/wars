@@ -3,60 +3,339 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agents War</title>
+<meta name="color-scheme" content="dark">
+<title>Agents War Control</title>
 <style>
-  body { font: 15px system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; color: #222; }
-  h1 { font-size: 1.4rem; }
-  .row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; margin: 1rem 0; }
-  input { padding: .5rem; font: inherit; width: 16rem; }
-  button { padding: .55rem 1.1rem; font: inherit; border: 1px solid #888; border-radius: 6px; background: #f4f4f4; cursor: pointer; }
-  button.race { background: #c62828; border-color: #c62828; color: #fff; font-weight: 600; }
-  button:disabled { opacity: .45; cursor: default; }
-  pre { background: #111; color: #ddd; padding: 1rem; border-radius: 6px; min-height: 12rem; white-space: pre-wrap; word-break: break-word; }
-  #config, #state { color: #555; }
+  :root {
+    --canvas: #0b0d10;
+    --surface: #12161b;
+    --surface-raised: #181d23;
+    --line: #2a3139;
+    --text: #f2f5f7;
+    --muted: #a8b2bd;
+    --accent: #7ee2b8;
+    --accent-ink: #07130e;
+    --danger: #ff665f;
+    --danger-dark: #b8332f;
+    --focus: #ffd166;
+    --radius: 14px;
+  }
+
+  * { box-sizing: border-box; }
+
+  html { background: var(--canvas); }
+
+  body {
+    min-height: 100vh;
+    margin: 0;
+    color: var(--text);
+    background: var(--canvas);
+    font: 16px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+
+  ::selection { color: var(--accent-ink); background: var(--accent); }
+
+  main {
+    width: min(100% - 2rem, 920px);
+    margin-inline: auto;
+    padding-block: clamp(2rem, 7vw, 5rem);
+  }
+
+  header {
+    display: flex;
+    align-items: end;
+    justify-content: space-between;
+    gap: 1rem;
+    padding-block-end: 1.25rem;
+    border-bottom: 1px solid var(--line);
+  }
+
+  h1 {
+    margin: 0;
+    font-size: clamp(1.7rem, 4vw, 2.6rem);
+    line-height: 1;
+    letter-spacing: -.03em;
+  }
+
+  .subtitle { margin: .6rem 0 0; color: var(--muted); max-width: 62ch; }
+
+  .status {
+    flex: none;
+    padding: .38rem .72rem;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    color: var(--muted);
+    background: var(--surface);
+    font-size: .875rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .status[data-state="running"] { color: var(--accent); border-color: color-mix(in srgb, var(--accent), transparent 55%); }
+  .status[data-state="failed"] { color: var(--danger); border-color: color-mix(in srgb, var(--danger), transparent 55%); }
+
+  form { margin-block-start: 2rem; }
+
+  fieldset {
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+  }
+
+  legend {
+    width: 100%;
+    margin-block-end: 1rem;
+    color: var(--muted);
+    font-size: .8rem;
+    font-weight: 700;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+  }
+
+  .fields {
+    display: grid;
+    grid-template-columns: 1.35fr 1fr minmax(8rem, .55fr);
+    gap: 1rem;
+  }
+
+  label { display: grid; min-width: 0; gap: .45rem; font-size: .9rem; font-weight: 650; }
+  label span { color: var(--muted); }
+
+  input {
+    min-width: 0;
+    width: 100%;
+    height: 2.9rem;
+    padding-inline: .85rem;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    color: var(--text);
+    background: var(--surface);
+    font: inherit;
+    caret-color: var(--accent);
+    outline: none;
+    transition: border-color 140ms ease-out, background 140ms ease-out;
+  }
+
+  input::placeholder { color: #77828d; }
+  input:hover { border-color: #46515d; }
+  input:focus-visible { border-color: var(--focus); box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus), transparent 78%); }
+  input:invalid:not(:placeholder-shown) { border-color: var(--danger); }
+
+  .access {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end;
+    gap: 1rem;
+    margin-block-start: 1.25rem;
+  }
+
+  .access label { max-width: 30rem; }
+  .hint { margin: .45rem 0 0; color: var(--muted); font-size: .82rem; }
+
+  .actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .65rem; }
+
+  button {
+    min-height: 2.9rem;
+    padding-inline: 1rem;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    color: var(--text);
+    background: var(--surface-raised);
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform 120ms ease-out, border-color 120ms ease-out, background 120ms ease-out;
+  }
+
+  button:hover:not(:disabled) { border-color: #536170; background: #20262d; }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:focus-visible { outline: 3px solid color-mix(in srgb, var(--focus), transparent 35%); outline-offset: 2px; }
+  button.race { color: #fff; border-color: var(--danger-dark); background: var(--danger-dark); }
+  button.race:hover:not(:disabled) { border-color: var(--danger); background: #c9403a; }
+  button:disabled { opacity: .42; cursor: not-allowed; }
+
+  .attempt-warning {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-block: 1.5rem .75rem;
+    color: var(--muted);
+    font-size: .88rem;
+  }
+
+  .attempt-warning strong { color: var(--danger); }
+
+  pre {
+    min-height: 18rem;
+    max-height: 54vh;
+    margin: 0;
+    overflow: auto;
+    padding: 1rem;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    color: #d9e1e8;
+    background: #080a0c;
+    font: .82rem/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    scrollbar-color: #3b4651 #080a0c;
+  }
+
+  .error { min-height: 1.5rem; margin-block-start: .75rem; color: var(--danger); }
+
+  h2 { margin: 0; font-size: 1rem; letter-spacing: -.01em; }
+
+  .results { margin-block: 1rem; }
+  .results-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin-block-end: .65rem; }
+  .results-head span { color: var(--muted); font-size: .82rem; }
+  .table-wrap { overflow-x: auto; padding: .25rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+  table { width: 100%; min-width: 38rem; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: .7rem .85rem; border-bottom: 1px solid var(--line); text-align: left; }
+  th { color: var(--muted); font-size: .72rem; letter-spacing: .08em; text-transform: uppercase; }
+  td { font-size: .86rem; }
+  tbody tr:last-child td { border-bottom: 0; }
+  .result-ok { color: var(--accent); font-weight: 700; }
+  .result-failed { color: var(--danger); font-weight: 700; }
+  .log-name { max-width: 15rem; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+  .log-heading { margin-block: 1.25rem .65rem; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+
+  @media (max-width: 720px) {
+    main { width: min(100% - 1.25rem, 920px); padding-block: 1.5rem; }
+    header { align-items: start; flex-direction: column; }
+    .fields, .access { grid-template-columns: 1fr; }
+    .actions { justify-content: stretch; }
+    .actions button { flex: 1 1 8rem; }
+    .attempt-warning { align-items: start; flex-direction: column; gap: .25rem; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { scroll-behavior: auto !important; transition: none !important; }
+  }
 </style>
 </head>
 <body>
-<h1>Agents War</h1>
-<div id="config">loading…</div>
-<div class="row">
-  <input id="token" type="password" placeholder="run token" autocomplete="current-password">
-  <button data-job="bench">Bench</button>
-  <button data-job="dry-run">Dry run</button>
-  <button data-job="race" class="race">Race</button>
-</div>
-<div id="state"></div>
-<pre id="output"></pre>
-<script>
-const token = document.getElementById('token');
-token.value = localStorage.getItem('runToken') || '';
-token.oninput = () => localStorage.setItem('runToken', token.value);
-const buttons = [...document.querySelectorAll('button[data-job]')];
+<main>
+  <header>
+    <div>
+      <h1>AMUNDI STU SQUAD</h1>
+      <p class="subtitle" id="subtitle">Racing non-stop. Read-only view of the race in progress.</p>
+    </div>
+    <div id="state" class="status" data-state="idle" role="status" aria-live="polite">Connecting…</div>
+  </header>
 
-for (const button of buttons) {
-  button.onclick = async () => {
-    const job = button.dataset.job;
-    if (job === 'race' && !confirm('Start a race? This spends one attempt.')) return;
-    const response = await fetch('/run/' + job, { method: 'POST', headers: { 'x-run-token': token.value } });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) alert(body.message || response.status);
-    refresh();
-  };
+  <section class="results">
+    <div class="table-wrap">
+      <table>
+        <caption class="sr-only">Race in progress</caption>
+        <thead><tr><th>Email</th><th>Attempt</th><th>Settings</th><th>Competition</th><th>Hedge</th></tr></thead>
+        <tbody><tr><td id="email">—</td><td id="attempt">—</td><td id="protocol">—</td><td id="code">—</td><td id="hedge">—</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+  <section class="results">
+    <div class="results-head">
+      <h2>Best times</h2>
+      <span>Server-measured, races that reached the goal</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <caption class="sr-only">Best race time per racer</caption>
+        <thead><tr><th>Racer</th><th>Best</th><th>Email</th><th>Settings</th><th>Races</th></tr></thead>
+        <tbody id="racers"></tbody>
+      </table>
+    </div>
+  </section>
+  <section class="results">
+    <div class="results-head">
+      <h2>Fastest settings</h2>
+      <span>Best race per racer, protocol, hedge, edge address and connection choice</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <caption class="sr-only">Best race time per setting</caption>
+        <thead><tr><th>Settings</th><th>Best</th><th>Email</th><th>Races</th></tr></thead>
+        <tbody id="variants"></tbody>
+      </table>
+    </div>
+  </section>
+  <div id="error" class="error" role="alert"></div>
+  <h2 class="log-heading">Live log</h2>
+  <pre id="output" tabindex="0" aria-label="Race output">Waiting for the first race.</pre>
+</main>
+
+<script>
+const state = document.getElementById('state');
+const error = document.getElementById('error');
+const output = document.getElementById('output');
+const field = id => document.getElementById(id);
+
+function formatTime(milliseconds) {
+  return Number.isFinite(milliseconds) ? `${(milliseconds / 1000).toFixed(3)} s` : '—';
+}
+
+// `values`: cell texts; the cell at `timeIndex` is the best time, `best` its race.
+function tableRow(values, timeIndex, best) {
+  const row = document.createElement('tr');
+  for (const [index, value] of values.entries()) {
+    const cell = document.createElement('td');
+    cell.textContent = value;
+    if (index === timeIndex) cell.className = 'result-ok';
+    if (index === timeIndex + 1) cell.className = 'log-name';
+    if (index === timeIndex && best) cell.title = new Date(best.at * 1000).toLocaleString();
+    row.append(cell);
+  }
+  return row;
+}
+
+function renderBests(names, racers, variants) {
+  document.getElementById('racers').replaceChildren(...names.map(name => {
+    const racer = racers[name];
+    const best = racer?.best;
+    return tableRow([
+      name,
+      best ? formatTime(best.elapsed_ms) : '—',
+      best ? best.email : '—',
+      racer ? racer.variant.replace(new RegExp(`^${name} `), '') : '—',
+      racer?.races ?? 0,
+    ], 1, best);
+  }));
+  document.getElementById('variants').replaceChildren(...variants.map(({ variant, best }) =>
+    tableRow([variant, formatTime(best.elapsed_ms), best.email, best.races], 1, best)));
 }
 
 async function refresh() {
-  const status = await (await fetch('/status')).json();
-  const c = status.config;
-  document.getElementById('config').textContent =
-    `${c.url} | email ${c.email ? 'set' : 'MISSING'} | nickname ${c.nickname || 'none (score not submitted)'} | hedge ${c.hedge_ms} ms`
-    + (c.buttons ? '' : ' | QUIZ_SC_RUN_TOKEN not set: buttons disabled');
-  for (const button of buttons) button.disabled = !c.buttons || !!status.running;
-  const last = status.last;
-  document.getElementById('state').textContent = status.running
-    ? `running: ${status.running}…`
-    : last ? `${last.job}: ${last.ok ? 'done' : 'failed'}` : 'idle';
-  document.getElementById('output').textContent = status.lines.join('\n');
+  try {
+    const response = await fetch('status', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`Status failed (${response.status})`);
+    const status = await response.json();
+    const config = status.config;
+    const current = status.current;
+    error.textContent = '';
+    field('code').textContent = config.code;
+    field('subtitle').textContent = `One race at a time, taking turns between racers (${config.racers.join(', ')}) and emails (${config.emails.join(', ')})${config.alternate_http ? ', alternating HTTP/2 and HTTP/1.1' : ''}. Read-only.`;
+    field('hedge').textContent = `${config.hedge_ms} ms`;
+    field('email').textContent = current ? current.email : '—';
+    field('attempt').textContent = current ? `${current.attempt} / ${config.attempts}` : '—';
+    field('protocol').textContent = current ? current.protocol : '—';
+    const racers = status.racers || {};
+    const names = [...new Set([...config.racers, ...Object.keys(racers)])];
+    renderBests(names, racers, status.variants || []);
+    const failed = current && current.state === 'failed';
+    state.dataset.state = failed ? 'failed' : current ? 'running' : 'idle';
+    state.textContent = failed ? 'Failed · next attempt soon' : current ? `Racing #${current.index}` : 'Starting…';
+    const atBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 40;
+    output.textContent = status.lines.length ? status.lines.join('\n') : 'Waiting for the first race.';
+    if (atBottom) output.scrollTop = output.scrollHeight;
+  } catch (problem) {
+    error.textContent = problem.message || 'Could not refresh status.';
+    state.dataset.state = 'failed';
+    state.textContent = 'Disconnected';
+  }
 }
+
 refresh();
 setInterval(refresh, 1000);
 </script>

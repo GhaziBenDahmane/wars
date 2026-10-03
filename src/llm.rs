@@ -47,13 +47,22 @@ impl Llm {
             "stream": false,
             "max_completion_tokens": 200,
         });
-        let response = self.client.post(&self.url).json(&body).send().await.context("LLM request")?;
+        let response = self
+            .client
+            .post(&self.url)
+            .json(&body)
+            .send()
+            .await
+            .context("LLM request")?;
         let status = response.status();
         let reply: Value = response.json().await.context("LLM body")?;
         if !status.is_success() {
             bail!("LLM answered {status}: {reply}");
         }
-        let text = reply["choices"][0]["message"]["content"].as_str().unwrap_or("").trim();
+        let text = reply["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .trim();
         if text.is_empty() {
             bail!("LLM returned no text");
         }

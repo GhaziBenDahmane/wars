@@ -4,7 +4,10 @@
 use anyhow::{Context, Result, anyhow};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 pub const ORIGIN: &str = "https://superchallenge.io";
 pub const PRODUCT_ID: &str = "superchallenge";
@@ -21,10 +24,19 @@ pub struct RpcError {
 
 impl std::fmt::Display for RpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message = self.body.get("message").and_then(Value::as_str).unwrap_or("");
+        let message = self
+            .body
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let code = self.body.get("code").and_then(Value::as_str).unwrap_or("");
-        write!(f, "{} failed ({} {code}): {message} data={}", self.procedure, self.status,
-               self.body.get("data").unwrap_or(&Value::Null))
+        write!(
+            f,
+            "{} failed ({} {code}): {message} data={}",
+            self.procedure,
+            self.status,
+            self.body.get("data").unwrap_or(&Value::Null)
+        )
     }
 }
 
@@ -36,14 +48,102 @@ pub struct Rpc {
     endpoint: String,
 }
 
+pub(crate) struct ResponseInfo {
+    version: reqwest::Version,
+    peer: Option<std::net::SocketAddr>,
+    vercel_id: Option<String>,
+    server_timing: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct CallTiming {
+    pub headers: Duration,
+    pub body: Duration,
+    pub total: Duration,
+    pub version: String,
+    pub peer: Option<String>,
+    pub vercel_id: Option<String>,
+    pub server_timing: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct HedgedResponse {
+    pub value: Value,
+    pub sent: usize,
+    pub winner_route: usize,
+    pub timing: CallTiming,
+}
+
+impl ResponseInfo {
+    fn from_response(response: &reqwest::Response) -> Self {
+        let header = |name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        Self {
+            version: response.version(),
+            peer: response.remote_addr(),
+            vercel_id: header("x-vercel-id"),
+            server_timing: header("server-timing"),
+        }
+    }
+
+    pub(crate) fn report(&self, index: usize) {
+        crate::say!(
+            "reqwest warmup route {index}: {:?} peer={:?} x-vercel-id={:?} server-timing={:?}",
+            self.version,
+            self.peer,
+            self.vercel_id,
+            self.server_timing
+        );
+    }
+}
+
+/// Set per race by `serve` to alternate protocols; clients built afterwards
+/// use HTTP/1.1 instead of HTTP/2.
+pub static HTTP1: AtomicBool = AtomicBool::new(false);
+
+/// `HTTP1`, or `QUIZ_SC_HTTP1=1` for the one-off commands.
+fn use_http1() -> bool {
+    HTTP1.load(Ordering::Relaxed)
+        || std::env::var("QUIZ_SC_HTTP1").is_ok_and(|value| value == "1")
+}
+
+/// Set per race: clients built afterwards connect to these Vercel edge
+/// addresses instead of the one DNS returns, route `i` to `EDGE_IPS[i % len]`.
+/// Empty keeps DNS.
+pub static EDGE_IPS: Mutex<Vec<IpAddr>> = Mutex::new(Vec::new());
+
+fn edge_ip(route: usize) -> Option<IpAddr> {
+    let edges = EDGE_IPS.lock().unwrap();
+    (!edges.is_empty()).then(|| edges[route % edges.len()])
+}
+
 impl Rpc {
     /// One client = one connection pool, so two `Rpc`s give two independent
     /// connections for hedging.
     pub fn new(user_agent: &str, cookie: Option<&str>) -> Result<Self> {
-        Self::with_origin(ORIGIN, user_agent, cookie)
+        Self::for_route(user_agent, cookie, 0)
+    }
+
+    /// The client of route `route`, on that route's edge address.
+    pub fn for_route(user_agent: &str, cookie: Option<&str>, route: usize) -> Result<Self> {
+        Self::build(ORIGIN, user_agent, cookie, edge_ip(route))
     }
 
     pub fn with_origin(origin: &str, user_agent: &str, cookie: Option<&str>) -> Result<Self> {
+        Self::build(origin, user_agent, cookie, None)
+    }
+
+    fn build(
+        origin: &str,
+        user_agent: &str,
+        cookie: Option<&str>,
+        edge: Option<IpAddr>,
+    ) -> Result<Self> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("content-type", "application/json".parse()?);
         headers.insert("x-product-id", PRODUCT_ID.parse()?);
@@ -53,10 +153,14 @@ impl Rpc {
             headers.insert("cookie", cookie.parse()?);
         }
         let mut builder = reqwest::Client::builder();
-        if origin.starts_with("http://127.0.0.1") {
-            builder = builder.no_proxy(); // a local test server, whatever the proxy settings
+        if use_http1() {
+            builder = builder.http1_only();
+        }
+        if let Some(ip) = edge {
+            builder = builder.resolve("superchallenge.io", SocketAddr::new(ip, 443));
         }
         let client = builder
+            .no_proxy()
             .user_agent(user_agent)
             .default_headers(headers)
             .tcp_nodelay(true)
@@ -67,7 +171,10 @@ impl Rpc {
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
             .build()?;
-        Ok(Self { client, endpoint: format!("{origin}{RPC_PREFIX}") })
+        Ok(Self {
+            client,
+            endpoint: format!("{origin}{RPC_PREFIX}"),
+        })
     }
 
     pub async fn call(&self, procedure: &str, input: &Value) -> Result<Value> {
@@ -76,19 +183,69 @@ impl Rpc {
     }
 
     pub async fn call_raw(&self, procedure: &str, body: Vec<u8>) -> Result<Value> {
-        let response = self
-            .client
+        Self::read_response(procedure, self.send_raw(procedure, body).await?).await
+    }
+
+    async fn call_raw_timed(&self, procedure: &str, body: Vec<u8>) -> Result<(Value, CallTiming)> {
+        let started = Instant::now();
+        let response = self.send_raw(procedure, body).await?;
+        let headers = started.elapsed();
+        let info = ResponseInfo::from_response(&response);
+        let body_started = Instant::now();
+        let value = Self::read_response(procedure, response).await?;
+        let body = body_started.elapsed();
+        Ok((
+            value,
+            CallTiming {
+                headers,
+                body,
+                total: started.elapsed(),
+                version: format!("{:?}", info.version),
+                peer: info.peer.map(|peer| peer.to_string()),
+                vercel_id: info.vercel_id,
+                server_timing: info.server_timing,
+            },
+        ))
+    }
+
+    pub(crate) async fn inspect(
+        &self,
+        procedure: &str,
+        input: &Value,
+    ) -> Result<(Value, ResponseInfo)> {
+        let body = serde_json::to_vec(&json!({ "json": input }))?;
+        let response = self.send_raw(procedure, body).await?;
+        let info = ResponseInfo::from_response(&response);
+        Ok((Self::read_response(procedure, response).await?, info))
+    }
+
+    async fn send_raw(&self, procedure: &str, body: Vec<u8>) -> Result<reqwest::Response> {
+        self.client
             .post(format!("{}{procedure}", self.endpoint))
             .body(body)
             .send()
             .await
-            .with_context(|| format!("{procedure}: request failed"))?;
+            .with_context(|| format!("{procedure}: request failed"))
+    }
+
+    async fn read_response(procedure: &str, response: reqwest::Response) -> Result<Value> {
         let status = response.status().as_u16();
-        let bytes = response.bytes().await.with_context(|| format!("{procedure}: body lost"))?;
+        let bytes = response
+            .bytes()
+            .await
+            .with_context(|| format!("{procedure}: body lost"))?;
         let mut envelope: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        let value = envelope.get_mut("json").map(Value::take).unwrap_or(envelope);
+        let value = envelope
+            .get_mut("json")
+            .map(Value::take)
+            .unwrap_or(envelope);
         if !(200..300).contains(&status) {
-            return Err(RpcError { procedure: procedure.into(), status, body: value }.into());
+            return Err(RpcError {
+                procedure: procedure.into(),
+                status,
+                body: value,
+            }
+            .into());
         }
         Ok(value)
     }
@@ -107,7 +264,7 @@ pub async fn hedged(
     input: &Value,
     hedge_after: Duration,
     max_requests: usize,
-) -> Result<(Value, usize)> {
+) -> Result<HedgedResponse> {
     let body = serde_json::to_vec(&json!({ "json": input }))?;
     let mut in_flight = FuturesUnordered::new();
     let mut sent = 0;
@@ -119,10 +276,12 @@ pub async fn hedged(
             if throttled {
                 tokio::time::sleep(THROTTLE_PAUSE).await;
             }
-            let route = routes[sent % routes.len()].clone();
+            let route_index = sent % routes.len();
+            let route = routes[route_index].clone();
             let body = body.clone();
             let procedure = procedure.to_string();
-            in_flight.push(async move { route.call_raw(&procedure, body).await });
+            in_flight
+                .push(async move { (route_index, route.call_raw_timed(&procedure, body).await) });
             sent += 1;
         } else if in_flight.is_empty() {
             return Err(last_error.unwrap_or_else(|| anyhow!("{procedure}: no route answered")));
@@ -136,13 +295,26 @@ pub async fn hedged(
             in_flight.next().await
         };
         match next {
-            Some(Ok(value)) => return Ok((value, sent)),
-            Some(Err(error)) if error.downcast_ref::<RpcError>().is_some_and(|e| e.status == 429) => {
+            Some((winner_route, Ok((value, timing)))) => {
+                return Ok(HedgedResponse {
+                    value,
+                    sent,
+                    winner_route,
+                    timing,
+                });
+            }
+            Some((_, Err(error)))
+                if error
+                    .downcast_ref::<RpcError>()
+                    .is_some_and(|e| e.status == 429) =>
+            {
                 throttled = true;
                 last_error = Some(error);
             }
-            Some(Err(error)) if error.downcast_ref::<RpcError>().is_some() => return Err(error),
-            Some(Err(error)) => last_error = Some(error), // transport failure: next route now
+            Some((_, Err(error))) if error.downcast_ref::<RpcError>().is_some() => {
+                return Err(error);
+            }
+            Some((_, Err(error))) => last_error = Some(error), // transport failure: next route now
             None => {}
         }
     }
@@ -156,9 +328,80 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    #[tokio::test]
+    async fn inspection_preserves_the_body_and_exposes_actual_response_metadata() {
+        use axum::{Json, Router, routing::post};
+        let router = Router::new().route(
+            "/api/rpc/superchallenge/getCompetition",
+            post(|| async {
+                (
+                    [
+                        ("x-vercel-id", "fra1::fra1::test"),
+                        ("server-timing", "app;dur=40"),
+                    ],
+                    Json(json!({"json": {"title": "test"}})),
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let route = Rpc::with_origin(&format!("http://{address}"), "test", None).unwrap();
+        let (body, info) = route.inspect("getCompetition", &json!({})).await.unwrap();
+        server.abort();
+        assert_eq!(body["title"], "test");
+        assert_eq!(info.version, reqwest::Version::HTTP_11);
+        assert_eq!(info.peer, Some(address));
+        assert_eq!(info.vercel_id.as_deref(), Some("fra1::fra1::test"));
+        assert_eq!(info.server_timing.as_deref(), Some("app;dur=40"));
+    }
+
+    #[tokio::test]
+    async fn timed_call_separates_response_headers_from_body_reading() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.set_nodelay(true).unwrap();
+            let mut buffer = vec![0; 4096];
+            let _ = socket.read(&mut buffer).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 20\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            socket.write_all(br#"{"json":{"ok":true}}"#).await.unwrap();
+        });
+        let route = Rpc::with_origin(&format!("http://{address}"), "test", None).unwrap();
+        let (value, timing) = route
+            .call_raw_timed("p", br#"{"json":{}}"#.to_vec())
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(value["ok"], true);
+        assert!(
+            timing.headers >= Duration::from_millis(15),
+            "{:?}",
+            timing.headers
+        );
+        assert!(
+            timing.body >= Duration::from_millis(20),
+            "{:?}",
+            timing.body
+        );
+        assert!(timing.total >= timing.headers + timing.body);
+        assert_eq!(timing.version, "HTTP/1.1");
+        assert_eq!(timing.peer.as_deref(), Some(address.to_string().as_str()));
+    }
+
     /// A one-request-per-connection server: request `n` (0-based) waits
     /// `delays[n]` ms, then answers `status` with `body`.
-    async fn server(delays: Vec<u64>, status: u16, body: &'static str) -> (String, Arc<AtomicUsize>) {
+    async fn server(
+        delays: Vec<u64>,
+        status: u16,
+        body: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let count = Arc::new(AtomicUsize::new(0));
@@ -184,18 +427,27 @@ mod tests {
     }
 
     fn routes(origin: &str) -> Vec<Rpc> {
-        (0..2).map(|_| Rpc::with_origin(origin, "test", None).unwrap()).collect()
+        (0..2)
+            .map(|_| Rpc::with_origin(origin, "test", None).unwrap())
+            .collect()
     }
 
     #[tokio::test]
     async fn a_slow_request_is_hedged() {
         let (origin, count) = server(vec![2000, 0], 200, r#"{"json":{"isCorrect":true}}"#).await;
         let started = std::time::Instant::now();
-        let (value, sent) = hedged(&routes(&origin), "p", &json!({}), Duration::from_millis(100), 4)
-            .await
-            .unwrap();
-        assert_eq!(value["isCorrect"], true);
-        assert_eq!(sent, 2);
+        let reply = hedged(
+            &routes(&origin),
+            "p",
+            &json!({}),
+            Duration::from_millis(100),
+            4,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.value["isCorrect"], true);
+        assert_eq!(reply.sent, 2);
+        assert_eq!(reply.winner_route, 1);
         assert!(started.elapsed() < Duration::from_millis(1000));
         assert_eq!(count.load(Ordering::SeqCst), 2);
     }
@@ -203,9 +455,15 @@ mod tests {
     #[tokio::test]
     async fn a_server_verdict_is_not_retried() {
         let (origin, count) = server(vec![], 409, r#"{"json":{"code":"CONFLICT"}}"#).await;
-        let error = hedged(&routes(&origin), "p", &json!({}), Duration::from_millis(500), 4)
-            .await
-            .unwrap_err();
+        let error = hedged(
+            &routes(&origin),
+            "p",
+            &json!({}),
+            Duration::from_millis(500),
+            4,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.downcast_ref::<RpcError>().unwrap().status, 409);
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
@@ -213,21 +471,43 @@ mod tests {
     #[tokio::test]
     async fn requests_are_capped() {
         let (origin, count) = server(vec![400; 10], 200, r#"{"json":1}"#).await;
-        let (_, sent) = hedged(&routes(&origin), "p", &json!({}), Duration::from_millis(50), 3)
-            .await
-            .unwrap();
-        assert_eq!(sent, 3);
+        let reply = hedged(
+            &routes(&origin),
+            "p",
+            &json!({}),
+            Duration::from_millis(50),
+            3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.sent, 3);
         assert_eq!(count.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
     async fn a_429_stops_the_duplicates_and_retries_alone() {
-        let (origin, count) = server(vec![0, 0, 0, 0], 429, r#"{"json":{"message":"Too Many Requests"}}"#).await;
+        let (origin, count) = server(
+            vec![0, 0, 0, 0],
+            429,
+            r#"{"json":{"message":"Too Many Requests"}}"#,
+        )
+        .await;
         let route = Rpc::with_origin(&origin, "test", None).unwrap();
         let started = std::time::Instant::now();
-        let result = hedged(&[route.clone(), route], "p", &json!({}), Duration::from_millis(5), 3).await;
+        let result = hedged(
+            &[route.clone(), route],
+            "p",
+            &json!({}),
+            Duration::from_millis(5),
+            3,
+        )
+        .await;
         assert!(result.is_err());
         assert_eq!(count.load(Ordering::SeqCst), 3);
-        assert!(started.elapsed() >= THROTTLE_PAUSE * 2, "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() >= THROTTLE_PAUSE * 2,
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

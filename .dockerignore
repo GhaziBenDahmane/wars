@@ -1,4 +1,6 @@
-target
-.git
+/target
+/runs
+/cpp/build
 .env
-runs
+*.pem
+*:Zone.Identifier

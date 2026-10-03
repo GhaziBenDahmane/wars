@@ -22,5 +22,10 @@ fn reproduces_the_verified_corpus() {
         checked += 1;
     }
     assert!(checked > 500, "corpus too small: {checked}");
-    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
