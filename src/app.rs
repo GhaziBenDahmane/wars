@@ -23,6 +23,9 @@ pub struct Common {
     /// Chrome profile directory to reuse (default: a throwaway one).
     #[arg(long, env = "QUIZ_SC_PROFILE")]
     pub profile: Option<PathBuf>,
+    /// Load the real play page instead of a stub with only the Turnstile widget.
+    #[arg(long, env = "QUIZ_SC_REAL_PAGE")]
+    pub real_page: bool,
     #[arg(long, env = "QUIZ_SC_TURNSTILE_TIMEOUT_S", default_value_t = 60)]
     pub turnstile_timeout_s: u64,
 }
@@ -57,6 +60,7 @@ async fn credentials(common: &Common) -> Result<browser::Credentials> {
         common.cdp_url.as_deref(),
         common.profile.as_deref(),
         &common.url,
+        !common.real_page,
         Duration::from_secs(common.turnstile_timeout_s),
     )
     .await?;

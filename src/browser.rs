@@ -35,12 +35,26 @@ new Promise((resolve, reject) => {
   };
   setTimeout(() => reject(new Error('turnstile timeout')), TIMEOUT_MS);
   if (window.turnstile) return render();
-  const script = document.createElement('script');
-  script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-  script.onload = render;
-  document.head.appendChild(script);
+  let script = document.querySelector('script[src*="challenges.cloudflare.com/turnstile"]');
+  if (!script) {
+    script = document.createElement('script');
+    script.src = TURNSTILE_SRC;
+    document.head.appendChild(script);
+  }
+  script.addEventListener('load', render);
 })
 "#;
+
+const TURNSTILE_SRC: &str = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+
+/// Served in place of the play page (the Turnstile solvers' trick): the widget
+/// runs on the real origin without loading the site, and its script starts
+/// downloading with the first byte.
+fn stub_page() -> String {
+    format!(
+        "<!doctype html><html><head><script src=\"{TURNSTILE_SRC}\" async></script></head><body></body></html>"
+    )
+}
 
 pub struct Credentials {
     pub turnstile_token: String,
@@ -51,6 +65,8 @@ pub struct Credentials {
 struct Cdp {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     next_id: u64,
+    /// Body that answers every paused request (see `Fetch.enable`).
+    stub: Option<String>,
 }
 
 impl Cdp {
@@ -60,8 +76,23 @@ impl Cdp {
         let message = json!({ "id": id, "method": method, "params": params }).to_string();
         self.socket.send(Message::text(message)).await?;
         while let Some(frame) = self.socket.next().await {
-            let Message::Text(text) = frame? else { continue };
+            let Message::Text(text) = frame? else {
+                continue;
+            };
             let reply: Value = serde_json::from_str(&text)?;
+            if reply["method"] == "Fetch.requestPaused"
+                && let Some(body) = &self.stub
+            {
+                self.next_id += 1; // its reply is skipped below
+                let fulfill = json!({ "id": self.next_id, "method": "Fetch.fulfillRequest", "params": {
+                    "requestId": reply["params"]["requestId"],
+                    "responseCode": 200,
+                    "responseHeaders": [{ "name": "content-type", "value": "text/html; charset=utf-8" }],
+                    "body": base64(body.as_bytes()),
+                }});
+                self.socket.send(Message::text(fulfill.to_string())).await?;
+                continue;
+            }
             if reply.get("id").and_then(Value::as_u64) != Some(id) {
                 continue; // an event
             }
@@ -81,7 +112,8 @@ impl Cdp {
             )
             .await?;
         if let Some(details) = result.get("exceptionDetails") {
-            let text = details["exception"]["description"].as_str()
+            let text = details["exception"]["description"]
+                .as_str()
                 .or(details["text"].as_str())
                 .unwrap_or("evaluation failed");
             bail!("{text}");
@@ -112,28 +144,45 @@ impl Cdp {
                     stable_since = None;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         bail!("the play page did not finish loading")
     }
 }
 
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().fold(0u32, |n, b| n << 8 | u32::from(*b)) << (8 * (3 - chunk.len()));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { TABLE[(n >> (18 - 6 * i)) as usize & 63] as char } else { '=' });
+        }
+    }
+    out
+}
+
 /// Chrome's DevTools HTTP endpoints, never through a proxy.
 fn local_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(3)).build()?)
+    Ok(reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()?)
 }
 
 async fn devtools_ready(cdp_url: &str, child: &mut Option<Child>) -> Result<Value> {
     let client = local_client()?;
     for _ in 0..80 {
         if let Some(child) = child.as_mut()
-            && let Some(status) = child.try_wait()? {
-                bail!("Chrome exited early with {status}");
-            }
+            && let Some(status) = child.try_wait()?
+        {
+            bail!("Chrome exited early with {status}");
+        }
         if let Ok(response) = client.get(format!("{cdp_url}/json/version")).send().await
-            && let Ok(version) = response.json::<Value>().await {
-                return Ok(version);
-            }
+            && let Ok(version) = response.json::<Value>().await
+        {
+            return Ok(version);
+        }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     bail!("Chrome did not open its DevTools port at {cdp_url}")
@@ -142,7 +191,10 @@ async fn devtools_ready(cdp_url: &str, child: &mut Option<Child>) -> Result<Valu
 /// The user agent of this Chrome without "Headless". It has to be a command
 /// line flag: a CDP override does not reach Turnstile's cross-origin iframe.
 async fn user_agent(chrome: &str) -> Result<String> {
-    let output = Command::new(chrome).arg("--version").output().await
+    let output = Command::new(chrome)
+        .arg("--version")
+        .output()
+        .await
         .with_context(|| format!("cannot start Chrome at {chrome:?}"))?;
     let version = String::from_utf8_lossy(&output.stdout);
     let major = version
@@ -177,15 +229,22 @@ fn launch(chrome: &str, port: u16, profile: &str, user_agent: &str) -> Result<Ch
         .with_context(|| format!("cannot start Chrome at {chrome:?}"))
 }
 
+/// A port nothing listens on, so racers running side by side each get
+/// their own Chrome.
+fn free_port() -> Result<u16> {
+    Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+}
+
 /// Launch (or attach to `cdp_url`) Chrome, open the play page and get a token.
 pub async fn credentials(
     chrome: &str,
     cdp_url: Option<&str>,
     profile: Option<&std::path::Path>,
     play_url: &str,
+    stub: bool,
     timeout: Duration,
 ) -> Result<Credentials> {
-    let port = 9334;
+    let port = free_port()?;
     // A throwaway profile unless one is given (kept, e.g. with accepted notices).
     let temporary = profile.is_none();
     let profile = profile.map(Into::into).unwrap_or_else(|| {
@@ -199,29 +258,52 @@ pub async fn credentials(
         Some(agent) => Some(launch(chrome, port, &profile.to_string_lossy(), agent)?),
         None => None,
     };
-    let cdp_url = cdp_url.map(str::to_string).unwrap_or(format!("http://127.0.0.1:{port}"));
+    let cdp_url = cdp_url
+        .map(str::to_string)
+        .unwrap_or(format!("http://127.0.0.1:{port}"));
     let result = async {
         let version = devtools_ready(&cdp_url, &mut child).await?;
         let user_agent = launched_agent.clone().unwrap_or_else(|| {
-            version["User-Agent"].as_str().unwrap_or_default().replace("HeadlessChrome", "Chrome")
+            version["User-Agent"]
+                .as_str()
+                .unwrap_or_default()
+                .replace("HeadlessChrome", "Chrome")
         });
-        let targets: Value = local_client()?.get(format!("{cdp_url}/json/list")).send().await?.json().await?;
+        let targets: Value = local_client()?
+            .get(format!("{cdp_url}/json/list"))
+            .send()
+            .await?
+            .json()
+            .await?;
         let page = targets
             .as_array()
             .and_then(|list| list.iter().find(|t| t["type"] == "page"))
             .ok_or_else(|| anyhow!("Chrome has no page target"))?;
-        let ws_url = page["webSocketDebuggerUrl"].as_str().ok_or_else(|| anyhow!("no DevTools URL"))?;
+        let ws_url = page["webSocketDebuggerUrl"]
+            .as_str()
+            .ok_or_else(|| anyhow!("no DevTools URL"))?;
         let (socket, _) = connect_async(ws_url).await.context("DevTools websocket")?;
-        let mut cdp = Cdp { socket, next_id: 0 };
+        let mut cdp = Cdp { socket, next_id: 0, stub: stub.then(stub_page) };
         cdp.send("Network.enable", json!({})).await?;
-        cdp.send("Page.navigate", json!({ "url": play_url })).await?;
-        cdp.settle(Duration::from_millis(1500)).await?;
+        if stub {
+            let pattern = json!([{ "urlPattern": play_url, "resourceType": "Document" }]);
+            cdp.send("Fetch.enable", json!({ "patterns": pattern })).await?;
+        }
+        cdp.send("Page.navigate", json!({ "url": play_url }))
+            .await?;
+        // The real page redirects and hydrates; the stub is ready once loaded.
+        let settle = if stub { Duration::ZERO } else { Duration::from_millis(1500) };
+        cdp.settle(settle).await?;
         let script = TURNSTILE_JS
             .replace("SITE_KEY", &json!(TURNSTILE_SITE_KEY).to_string())
+            .replace("TURNSTILE_SRC", &json!(TURNSTILE_SRC).to_string())
             .replace("TIMEOUT_MS", &timeout.as_millis().to_string());
         let token = cdp.evaluate(&script).await.context("Turnstile")?;
         let cookies = cdp
-            .send("Network.getCookies", json!({ "urls": [format!("{}/", crate::rpc::ORIGIN)] }))
+            .send(
+                "Network.getCookies",
+                json!({ "urls": [format!("{}/", crate::rpc::ORIGIN)] }),
+            )
             .await?;
         let cookie = cookies["cookies"]
             .as_array()
@@ -231,7 +313,10 @@ pub async fn credentials(
             .collect::<Vec<_>>()
             .join("; ");
         Ok(Credentials {
-            turnstile_token: token.as_str().ok_or_else(|| anyhow!("empty Turnstile token"))?.to_string(),
+            turnstile_token: token
+                .as_str()
+                .ok_or_else(|| anyhow!("empty Turnstile token"))?
+                .to_string(),
             user_agent,
             cookie,
         })
@@ -245,4 +330,18 @@ pub async fn credentials(
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base64;
+
+    #[test]
+    fn base64_pads() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"<html>"), "PGh0bWw+");
+    }
 }
