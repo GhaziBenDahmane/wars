@@ -257,6 +257,8 @@ void race(Session& session, const Config& config, const std::string& turnstile_t
         // Never duplicated: a second startRunV2 could spend a second attempt.
         json start = session.routes[0].call("startRunV2", start_input);
         auto received = Clock::now();
+        const auto start_received = received;
+        bool aborted = false;
         json start_event{{"response", start}};
         // Set by the Rust `serve` platform: what this race tries.
         if (const char* variant = std::getenv("QUIZ_SC_VARIANT"))
@@ -334,6 +336,13 @@ void race(Session& session, const Config& config, const std::string& turnstile_t
                 break;
             }
             ++answered;
+            if (config.abort_after > 0 && answered == config.abort_after &&
+                received - start_received > config.abort_limit) {
+                aborted = true;
+                ended = format("aborted: the first %zu answers took %.0f ms (limit %.0f ms)", answered,
+                               ms(received - start_received), ms(config.abort_limit));
+                break;
+            }
             for (auto& n : next) {
                 const json* next_id = member(n, "id");
                 bool known = std::any_of(queue.begin(), queue.end(), [&](const json& d) {
@@ -347,7 +356,9 @@ void race(Session& session, const Config& config, const std::string& turnstile_t
         say(format("run ended: %s after %zu correct in %.3fs", ended.c_str(), answered,
                    std::chrono::duration<double>(elapsed).count()));
         print_summary(answers);
-        if (config.nickname && !config.nickname->empty()) {
+        if (aborted) {
+            say("aborted: score not submitted");
+        } else if (config.nickname && !config.nickname->empty()) {
             json input = session.base;
             input["runToken"] = run_token;
             input["email"] = config.email;

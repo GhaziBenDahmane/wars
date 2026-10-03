@@ -34,7 +34,10 @@ ENV QUIZ_SC_CHROME=chromium \
     QUIZ_SC_RUNS_DIR=/data/runs \
     QUIZ_SC_ENGINES=rust,go=/usr/local/bin/agentwars-go,cpp=/usr/local/bin/agentwars-cpp:http1 \
     QUIZ_SC_HEDGE_MS_LIST=150,100,80 \
-    QUIZ_SC_EDGE_IPS=dns,216.150.16.193,76.76.21.21,64.29.17.1,216.150.1.1+76.76.21.21,216.150.1.1+216.150.16.193
+    QUIZ_SC_EDGE_IPS=64.29.17.1,216.150.16.193,216.198.79.1 \
+    QUIZ_SC_ABORT_AFTER=30 \
+    QUIZ_SC_ABORT_MS=1500 \
+    QUIZ_SC_HEADERS_LIST=chrome,bare
 VOLUME /data
 WORKDIR /data
 EXPOSE 3000

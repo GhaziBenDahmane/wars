@@ -88,6 +88,10 @@ enum Command {
         /// Comma-separated 0/1: races with and without following the winner.
         #[arg(long, env = "QUIZ_SC_FOLLOW_WINNER_LIST", value_delimiter = ',')]
         follow_winner_list: Vec<String>,
+        /// Comma-separated `chrome`/`bare`: answers with or without Chrome's
+        /// user agent and cookie (this binary only).
+        #[arg(long, env = "QUIZ_SC_HEADERS_LIST", value_delimiter = ',')]
+        headers_list: Vec<String>,
         #[arg(long, env = "QUIZ_SC_ATTEMPTS_PER_EMAIL", default_value_t = 10,
               value_parser = clap::value_parser!(u8).range(1..))]
         attempts: u8,
@@ -130,6 +134,7 @@ async fn main() -> Result<()> {
             hedge_ms_list,
             edge_list,
             follow_winner_list,
+            headers_list,
             attempts,
             email_start,
         } => {
@@ -141,6 +146,7 @@ async fn main() -> Result<()> {
                 hedge_ms_list,
                 &edge_list,
                 &follow_winner_list,
+                &headers_list,
             )?;
             web::serve(race, &host, port, prefixes, attempts, variants, email_start).await?
         }
@@ -165,9 +171,12 @@ mod tests {
         match Cli::try_parse_from([
             "agentwars", "serve", "--edge-list", "dns,216.150.1.1+76.76.21.21",
             "--edge-ips", "64.29.17.1", "--hedge-ms-list", "150,80", "--follow-winner-list", "0,1",
-            "--engines", "rust,go=/usr/local/bin/agentwars-go",
+            "--engines", "rust,go=/usr/local/bin/agentwars-go", "--headers-list", "chrome,bare",
+            "--abort-after", "30", "--abort-ms", "1500",
         ]).unwrap().command {
-            Command::Serve { race, engines, edge_list, hedge_ms_list, follow_winner_list, .. } => {
+            Command::Serve { race, engines, edge_list, hedge_ms_list, follow_winner_list, headers_list, .. } => {
+                assert_eq!(headers_list, ["chrome", "bare"]);
+                assert_eq!((race.abort_after, race.abort_ms), (30, 1500));
                 assert_eq!(engines, ["rust", "go=/usr/local/bin/agentwars-go"]);
                 assert_eq!(edge_list, ["dns", "216.150.1.1+76.76.21.21"]);
                 assert_eq!(race.common.edge_ips, ["64.29.17.1".parse::<std::net::IpAddr>().unwrap()]);

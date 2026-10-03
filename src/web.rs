@@ -99,6 +99,7 @@ pub struct Variants {
     hedge_ms: Vec<u64>,
     edge_ips: Vec<Vec<IpAddr>>,
     follow_winner: Vec<bool>,
+    bare_answers: Vec<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -109,6 +110,8 @@ struct Variant {
     /// One per route in turn; empty keeps DNS.
     edge_ips: Vec<IpAddr>,
     follow_winner: bool,
+    /// Answers without Chrome's user agent and cookie (this binary only).
+    bare_answers: bool,
 }
 
 impl Variant {
@@ -125,7 +128,8 @@ impl Variant {
         };
         let follow = if self.follow_winner { "follow" } else { "fixed" };
         let (engine, protocol, hedge) = (&self.engine.name, self.protocol(), self.hedge_ms);
-        format!("{engine} {protocol} hedge {hedge} edge {edge} {follow}")
+        let bare = if self.bare_answers { " bare" } else { "" };
+        format!("{engine} {protocol} hedge {hedge} edge {edge} {follow}{bare}")
     }
 
     /// Written to the race log, to compare variants afterwards.
@@ -136,6 +140,7 @@ impl Variant {
             "edge_ips": self.edge_ips,
             "follow_winner": self.follow_winner,
             "http1": self.http1,
+            "bare_answers": self.bare_answers,
         })
     }
 }
@@ -157,6 +162,7 @@ impl Variants {
         hedge_ms: Vec<u64>,
         edge_ips: &[String],
         follow_winner: &[String],
+        headers: &[String],
     ) -> Result<Self> {
         let edge_ips = edge_ips
             .iter()
@@ -176,6 +182,14 @@ impl Variants {
                 value => Err(anyhow::anyhow!("follow winner must be 0 or 1, not {value:?}")),
             })
             .collect::<Result<Vec<_>>>()?;
+        let bare_answers = headers
+            .iter()
+            .map(|value| match value.trim() {
+                "chrome" => Ok(false),
+                "bare" => Ok(true),
+                value => Err(anyhow::anyhow!("answer headers must be chrome or bare, not {value:?}")),
+            })
+            .collect::<Result<Vec<_>>>()?;
         fn or<T>(list: Vec<T>, single: T) -> Vec<T> {
             if list.is_empty() { vec![single] } else { list }
         }
@@ -186,6 +200,7 @@ impl Variants {
             hedge_ms: or(hedge_ms, args.hedge_ms),
             edge_ips: or(edge_ips, args.common.edge_ips.clone()),
             follow_winner: or(follow_winner, args.follow_winner),
+            bare_answers: or(bare_answers, args.bare_answers),
         })
     }
 
@@ -204,7 +219,8 @@ impl Variants {
         let edge_ips = self.edge_ips[take(self.edge_ips.len())].clone();
         // Only this binary follows the winner.
         let follow_winner = self.follow_winner[take(self.follow_winner.len())] && engine.path.is_none();
-        Variant { engine, http1, hedge_ms, edge_ips, follow_winner }
+        let bare_answers = self.bare_answers[take(self.bare_answers.len())] && engine.path.is_none();
+        Variant { engine, http1, hedge_ms, edge_ips, follow_winner, bare_answers }
     }
 }
 
@@ -427,6 +443,7 @@ fn race_forever(panel: &Panel, start: u64) {
         args.hedge_ms = variant.hedge_ms;
         args.common.edge_ips = variant.edge_ips.clone();
         args.follow_winner = variant.follow_winner;
+        args.bare_answers = variant.bare_answers;
         args.variant = Some(variant.describe());
         *position = position.next(attempts);
         // Saved before racing: a crash mid-race must not repeat this attempt.
@@ -586,6 +603,7 @@ mod tests {
             hedge_ms: vec![150, 80],
             edge_ips: vec![vec![], vec!["76.76.21.21".parse().unwrap()]],
             follow_winner: vec![false, true],
+            bare_answers: vec![false],
         };
         let labels: Vec<String> = (0..8).map(|turn| variants.pick(turn).label()).collect();
         let mut unique = labels.clone();
@@ -606,10 +624,10 @@ mod tests {
         )
         .unwrap();
         let edges = ["dns".to_string(), "216.150.1.1+76.76.21.21".to_string()];
-        let variants = Variants::parse(&args, &[], false, vec![], &edges, &[]).unwrap();
+        let variants = Variants::parse(&args, &[], false, vec![], &edges, &[], &[]).unwrap();
         assert_eq!(variants.pick(0).label(), "rust HTTP/2 hedge 150 edge dns fixed");
         assert_eq!(variants.pick(1).label(), "rust HTTP/2 hedge 150 edge 216.150.1.1+76.76.21.21 fixed");
-        assert!(Variants::parse(&args, &[], false, vec![], &["1.2.3".to_string()], &[]).is_err());
+        assert!(Variants::parse(&args, &[], false, vec![], &["1.2.3".to_string()], &[], &[]).is_err());
     }
 
     fn default_args() -> RaceArgs {
@@ -623,7 +641,7 @@ mod tests {
     fn racers_change_every_race_and_only_rust_follows_the_winner() {
         let engines = ["rust", "go=/bin/go-racer", "cpp=/bin/cpp-racer:http1"].map(String::from);
         let variants =
-            Variants::parse(&default_args(), &engines, false, vec![], &[], &["1".into()]).unwrap();
+            Variants::parse(&default_args(), &engines, false, vec![], &[], &["1".into()], &[]).unwrap();
         let labels: Vec<String> = (0..3).map(|turn| variants.pick(turn).label()).collect();
         assert_eq!(labels, [
             "rust HTTP/2 hedge 150 edge dns follow",
@@ -633,6 +651,12 @@ mod tests {
         assert_eq!(variants.pick(2).engine.path, Some(PathBuf::from("/bin/cpp-racer")));
         assert!(Engine::parse("go").is_err());
         assert_eq!(engine_of("HTTP/2"), "rust");
+        let headers = ["chrome", "bare"].map(String::from);
+        let variants = Variants::parse(&default_args(), &engines, false, vec![], &[], &[], &headers).unwrap();
+        let labels: Vec<String> = (0..6).map(|turn| variants.pick(turn).label()).collect();
+        assert_eq!(labels[3], "rust HTTP/2 hedge 150 edge dns fixed bare");
+        assert_eq!(labels[4], "go HTTP/2 hedge 150 edge dns fixed", "only rust answers bare");
+        assert!(Variants::parse(&default_args(), &[], false, vec![], &[], &[], &["firefox".into()]).is_err());
         assert_eq!(engine_of("go HTTP/2 hedge 80 edge dns fixed"), "go");
     }
 
@@ -672,6 +696,7 @@ mod tests {
             hedge_ms: 80,
             edge_ips: vec!["216.150.1.1".parse().unwrap(), "76.76.21.21".parse().unwrap()],
             follow_winner: false,
+            bare_answers: false,
         };
         let mut args = default_args();
         args.email = Some("ok@x.com".into());

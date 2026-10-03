@@ -22,6 +22,6 @@ struct Credentials {
 /// A launched Chrome is killed before this returns.
 Credentials credentials(const std::string& chrome, const std::optional<std::string>& cdp_url,
                         const std::optional<std::string>& profile, const std::string& play_url,
-                        std::chrono::seconds timeout);
+                        bool stub, std::chrono::seconds timeout);
 
 }  // namespace browser

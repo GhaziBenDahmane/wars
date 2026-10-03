@@ -71,6 +71,17 @@ pub struct RaceArgs {
     /// What this race tries, for its log; set by `serve`.
     #[arg(skip)]
     pub variant: Option<serde_json::Value>,
+    /// Send the answers without Chrome's user agent and cookie (the run is
+    /// still started with them).
+    #[arg(long, env = "QUIZ_SC_BARE_ANSWERS", action = clap::ArgAction::SetTrue,
+          value_parser = clap::builder::FalseyValueParser::new())]
+    pub bare_answers: bool,
+    /// Abort a race once this many answers are in if they took longer than
+    /// `--abort-ms` (0: never abort).
+    #[arg(long, env = "QUIZ_SC_ABORT_AFTER", default_value_t = 0)]
+    pub abort_after: usize,
+    #[arg(long, env = "QUIZ_SC_ABORT_MS", default_value_t = 1500)]
+    pub abort_ms: u64,
     #[arg(long, env = "QUIZ_SC_RUNS_DIR", default_value = "runs")]
     pub runs_dir: PathBuf,
     /// Use this Turnstile token instead of getting one from Chrome.
@@ -236,7 +247,15 @@ pub async fn run_race(args: &RaceArgs) -> Result<()> {
     };
     let code = race::competition_code(&args.common.url);
     pin_edge(&args.common);
-    let session = race::Session::new(&code, &user_agent, Some(&cookie), 2)?;
+    let session = if args.bare_answers {
+        let mut session = race::Session::new(&code, "", None, 2)?;
+        let starter = rpc::Rpc::new(&user_agent, Some(&cookie))?;
+        starter.call("getCompetition", &session.base).await?; // open its connection
+        session.starter = Some(starter);
+        session
+    } else {
+        race::Session::new(&code, &user_agent, Some(&cookie), 2)?
+    };
     report_competition(&session.warm().await?);
     let llm = Llm::from_env()?;
     let config = race::Config {
@@ -253,7 +272,12 @@ pub async fn run_race(args: &RaceArgs) -> Result<()> {
             "edge_ips": args.common.edge_ips,
             "follow_winner": args.follow_winner,
             "http1": rpc::HTTP1.load(std::sync::atomic::Ordering::Relaxed),
+            "bare_answers": args.bare_answers,
         })),
+        abort: (args.abort_after > 0).then(|| race::Abort {
+            after: args.abort_after,
+            limit: Duration::from_millis(args.abort_ms),
+        }),
         runs_dir: args.runs_dir.clone(),
     };
     race::race(&session, &config, &token, llm.as_ref()).await

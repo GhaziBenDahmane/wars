@@ -454,4 +454,16 @@ TEST(a_full_race_answers_every_drill_and_saves_the_log) {
     }
     CHECK(events == std::vector<std::string>({"start", "answer", "answer", "answer", "score"}));
     std::filesystem::remove_all(dir);
+    // Aborted: the first two answers take longer than 0 ms.
+    submissions.clear();
+    race::Config aborting{"CODE", "a@b.c", std::string("nick"), "fr", 150ms, 4, dir.string(), 2, 0ms};
+    race::race(session, aborting, "token", nullptr);
+    CHECK(submissions == std::vector<std::string>({"1003", "NoM"}));
+    events.clear();
+    for (auto& entry : std::filesystem::directory_iterator(dir)) {
+        std::ifstream file(entry.path());
+        for (std::string line; std::getline(file, line);) events.push_back(json::parse(line)["event"]);
+    }
+    CHECK(events == std::vector<std::string>({"start", "answer", "answer"}));
+    std::filesystem::remove_all(dir);
 }

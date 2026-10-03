@@ -48,6 +48,11 @@ type Config struct {
 	HedgeAfter  time.Duration
 	MaxRequests int
 	RunsDir     string
+	// AbortAfter, when positive, gives up a race whose first AbortAfter
+	// answers took longer than AbortLimit: it will not be a best time, and
+	// the next race starts sooner.
+	AbortAfter int
+	AbortLimit time.Duration
 }
 
 type Session struct {
@@ -393,6 +398,8 @@ func run(ctx context.Context, session *Session, config *Config, turnstileToken s
 		return err
 	}
 	received := time.Now()
+	startReceived := received
+	aborted := false
 	startEvent := Object{"response": start}
 	// Set by the Rust `serve` platform: what this race tries.
 	if variant := os.Getenv("QUIZ_SC_VARIANT"); variant != "" {
@@ -482,6 +489,12 @@ func run(ctx context.Context, session *Session, config *Config, turnstileToken s
 			break
 		}
 		answered++
+		if config.AbortAfter > 0 && answered == config.AbortAfter && received.Sub(startReceived) > config.AbortLimit {
+			aborted = true
+			ended = fmt.Sprintf("aborted: the first %d answers took %d ms (limit %d ms)",
+				answered, received.Sub(startReceived).Milliseconds(), config.AbortLimit.Milliseconds())
+			break
+		}
 		for _, next := range FindDrills(response) {
 			if !slices.ContainsFunc(queue, func(d Object) bool { return reflect.DeepEqual(d["id"], next["id"]) }) {
 				queue = append(queue, next)
@@ -490,6 +503,10 @@ func run(ctx context.Context, session *Session, config *Config, turnstileToken s
 	}
 	report.Say("run ended: %s after %d correct in %.3fs", ended, answered, time.Since(raceStarted).Seconds())
 	printSummary(summary)
+	if aborted {
+		report.Say("aborted: score not submitted")
+		return nil
+	}
 	if config.Nickname == "" {
 		report.Say("no nickname: score not submitted to the leaderboard")
 		return nil

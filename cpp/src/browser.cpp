@@ -49,12 +49,25 @@ new Promise((resolve, reject) => {
   };
   setTimeout(() => reject(new Error('turnstile timeout')), TIMEOUT_MS);
   if (window.turnstile) return render();
-  const script = document.createElement('script');
-  script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-  script.onload = render;
-  document.head.appendChild(script);
+  let script = document.querySelector('script[src*="challenges.cloudflare.com/turnstile"]');
+  if (!script) {
+    script = document.createElement('script');
+    script.src = TURNSTILE_SRC;
+    document.head.appendChild(script);
+  }
+  script.addEventListener('load', render);
 })
 )";
+
+const char* const TURNSTILE_SRC = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+
+/// Served in place of the play page (the Turnstile solvers' trick): the widget
+/// runs on the real origin without loading the site, and its script starts
+/// downloading with the first byte.
+std::string stub_page() {
+    return std::string("<!doctype html><html><head><script src=\"") + TURNSTILE_SRC +
+           "\" async></script></head><body></body></html>";
+}
 
 std::runtime_error error(const std::string& message) { return std::runtime_error(message); }
 
@@ -227,11 +240,27 @@ class Cdp {
 public:
     explicit Cdp(const std::string& url, std::chrono::seconds timeout) : socket_(url, timeout) {}
 
+    /// Body that answers every paused request (see `Fetch.enable`); empty: none.
+    std::string stub;
+
     json send(const std::string& method, json params) {
         int id = ++next_id_;
         socket_.send_text(json{{"id", id}, {"method", method}, {"params", std::move(params)}}.dump());
         while (true) {
             json reply = json::parse(socket_.receive_text(), nullptr, false);
+            if (!stub.empty() && reply.is_object() && reply.value("method", "") == "Fetch.requestPaused") {
+                std::string body = base64(reinterpret_cast<const unsigned char*>(stub.data()), stub.size());
+                // Its reply is skipped below.
+                socket_.send_text(json{{"id", ++next_id_},
+                                       {"method", "Fetch.fulfillRequest"},
+                                       {"params",
+                                        {{"requestId", reply["params"].value("requestId", "")},
+                                         {"responseCode", 200},
+                                         {"responseHeaders", {{{"name", "content-type"}, {"value", "text/html; charset=utf-8"}}}},
+                                         {"body", body}}}}
+                                      .dump());
+                continue;
+            }
             if (!reply.is_object() || !reply.contains("id") || reply["id"] != id) continue;  // an event
             if (reply.contains("error")) throw error(method + ": " + reply["error"].dump());
             return reply.value("result", json::object());
@@ -275,7 +304,7 @@ public:
                     stable_since.reset();
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
         throw error("the play page did not finish loading");
     }
@@ -396,7 +425,7 @@ int free_port() {
 }  // namespace
 
 Credentials credentials(const std::string& chrome, const std::optional<std::string>& cdp_url_arg,
-                        const std::optional<std::string>& profile_arg, const std::string& play_url,
+                        const std::optional<std::string>& profile_arg, const std::string& play_url, bool stub,
                         std::chrono::seconds timeout) {
     int port = free_port();
     // A throwaway profile unless one is given (kept, e.g. with accepted notices).
@@ -433,10 +462,15 @@ Credentials credentials(const std::string& chrome, const std::optional<std::stri
                 }
         if (ws_url.empty()) throw error("Chrome has no page target");
         Cdp cdp(ws_url, timeout + std::chrono::seconds(30));
+        if (stub) cdp.stub = stub_page();
         cdp.send("Network.enable", json::object());
+        if (stub)
+            cdp.send("Fetch.enable", {{"patterns", {{{"urlPattern", play_url}, {"resourceType", "Document"}}}}});
         cdp.send("Page.navigate", {{"url", play_url}});
-        cdp.settle(std::chrono::milliseconds(1500));
+        // The real page redirects and hydrates; the stub is ready once loaded.
+        cdp.settle(std::chrono::milliseconds(stub ? 0 : 1500));
         std::string script = replace_all(TURNSTILE_JS, "SITE_KEY", json(TURNSTILE_SITE_KEY).dump());
+        script = replace_all(script, "TURNSTILE_SRC", json(TURNSTILE_SRC).dump());
         script = replace_all(script, "TIMEOUT_MS", std::to_string(timeout.count() * 1000));
         json token;
         try {

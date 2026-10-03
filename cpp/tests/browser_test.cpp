@@ -128,6 +128,9 @@ private:
             if (!call.is_object()) continue;  // a pong
             std::string method = call["method"];
             methods.push_back(method);
+            if (method == "Page.navigate" && paused)
+                send_all(fd, frame(0x1, json{{"method", "Fetch.requestPaused"}, {"params", {{"requestId", "r1"}}}}.dump()));
+            if (method == "Fetch.fulfillRequest") fulfilled = call["params"];
             json result = json::object();
             if (method == "Runtime.evaluate") {
                 std::string expression = call["params"]["expression"];
@@ -146,6 +149,12 @@ private:
         }
     }
 
+public:
+    /// Pause the navigation like `Fetch.enable` does.
+    bool paused = false;
+    json fulfilled;
+
+private:
     int listen_ = -1;
     uint16_t port_ = 0;
     std::thread thread_;
@@ -155,11 +164,25 @@ private:
 
 TEST(credentials_come_from_an_attached_chrome) {
     FakeChrome chrome;
-    auto c = browser::credentials("unused", chrome.url(), std::nullopt, "https://x/play/SC-ABC", std::chrono::seconds(5));
+    auto c = browser::credentials("unused", chrome.url(), std::nullopt, "https://x/play/SC-ABC", false,
+                                  std::chrono::seconds(5));
     CHECK_EQ(c.turnstile_token, "turnstile-token");
     CHECK_EQ(c.user_agent, "Mozilla/5.0 Chrome/149.0.0.0");
     CHECK_EQ(c.cookie, "a=1; b=2");
     CHECK_EQ(chrome.methods.front(), "Network.enable");
     CHECK_EQ(chrome.methods[1], "Page.navigate");
     CHECK_EQ(chrome.methods.back(), "Network.getCookies");
+}
+
+TEST(the_stub_page_answers_the_paused_play_page) {
+    FakeChrome chrome;
+    chrome.paused = true;
+    auto c = browser::credentials("unused", chrome.url(), std::nullopt, "https://x/play/SC-ABC", true,
+                                  std::chrono::seconds(5));
+    CHECK_EQ(c.turnstile_token, "turnstile-token");
+    CHECK_EQ(chrome.methods[1], "Fetch.enable");
+    CHECK_EQ(chrome.methods[2], "Page.navigate");
+    CHECK_EQ(chrome.methods[3], "Fetch.fulfillRequest");
+    CHECK_EQ(chrome.fulfilled["requestId"], "r1");
+    CHECK_EQ(chrome.fulfilled["responseCode"], 200);
 }

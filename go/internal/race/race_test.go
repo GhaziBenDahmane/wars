@@ -252,3 +252,82 @@ func TestDrillsFromResponses(t *testing.T) {
 		t.Fatal("drills")
 	}
 }
+
+// raceServer serves a competition of `drills` questions, each answered after
+// `delay`, and records the procedures called.
+func raceServer(t *testing.T, drills int, delay time.Duration) (*Session, func() []string) {
+	var mu sync.Mutex
+	var calls []string
+	drill := func(index int) map[string]any {
+		return map[string]any{"id": "gen-" + strconv.Itoa(index),
+			"patternData": map[string]any{"prompt": "TASK: compute (1 + 1) mod 7 | ANSWER: digits only"}}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		procedure := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+		mu.Lock()
+		calls = append(calls, procedure)
+		mu.Unlock()
+		var body struct {
+			JSON map[string]any `json:"json"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		var reply any
+		switch procedure {
+		case "startRunV2":
+			reply = map[string]any{"runToken": "token", "drills": []any{drill(0)},
+				"setup": map[string]any{"agentWars": map[string]any{"questionDeadlineSec": 2}}}
+		case "submitAnswerV2":
+			time.Sleep(delay)
+			index, _ := strconv.Atoi(strings.TrimPrefix(body.JSON["drillId"].(string), "gen-"))
+			last := index+1 == drills
+			answer := map[string]any{"isCorrect": body.JSON["submission"] == "2", "runningScore": (index + 1) * 5000}
+			if last {
+				answer["ended"] = "goal"
+			} else {
+				answer["next"] = drill(index + 1)
+			}
+			reply = answer
+		default:
+			reply = map[string]any{"agentWars": map[string]any{"ended": "goal"}}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"json": reply})
+	}))
+	t.Cleanup(server.Close)
+	session := &Session{Routes: []*rpc.Rpc{rpc.WithOrigin(server.URL, "t", ""), rpc.WithOrigin(server.URL, "t", "")},
+		Base: Object{"code": "test"}}
+	return session, func() []string { mu.Lock(); defer mu.Unlock(); return slices.Clone(calls) }
+}
+
+func count(calls []string, procedure string) int {
+	n := 0
+	for _, call := range calls {
+		if call == procedure {
+			n++
+		}
+	}
+	return n
+}
+
+func TestASlowStartAbortsTheRaceWithoutSavingTheScore(t *testing.T) {
+	session, calls := raceServer(t, 50, 10*time.Millisecond)
+	config := &Config{Code: "test", Email: "a@b.c", Nickname: "team", HedgeAfter: 5 * time.Second,
+		MaxRequests: 1, RunsDir: t.TempDir(), AbortAfter: 5, AbortLimit: 20 * time.Millisecond}
+	if err := Race(ctx, session, config, "turnstile", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls(); count(got, "submitAnswerV2") != 5 || count(got, "submitScoreV2") != 0 {
+		t.Fatalf("calls: %v", got)
+	}
+}
+
+func TestAFastStartRacesToTheGoalAndSavesTheScore(t *testing.T) {
+	session, calls := raceServer(t, 50, 0)
+	config := &Config{Code: "test", Email: "a@b.c", Nickname: "team", HedgeAfter: 5 * time.Second,
+		MaxRequests: 1, RunsDir: t.TempDir(), AbortAfter: 5, AbortLimit: 5 * time.Second}
+	if err := Race(ctx, session, config, "turnstile", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls(); count(got, "submitAnswerV2") != 50 || got[len(got)-1] != "submitScoreV2" {
+		t.Fatalf("calls: %v", got)
+	}
+}

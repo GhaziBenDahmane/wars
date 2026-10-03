@@ -56,6 +56,17 @@ func (f *Flags) Int(p *int, name, env string, def int, usage string) {
 	f.IntVar(p, name, def, usage+envNote(env))
 }
 
+func (f *Flags) Bool(p *bool, name, env string, def bool, usage string) {
+	if value := os.Getenv(env); env != "" && value != "" {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			f.errs = append(f.errs, fmt.Errorf("invalid %s %q: %w", env, value, err))
+		}
+		def = parsed
+	}
+	f.BoolVar(p, name, def, usage+envNote(env))
+}
+
 func envNote(env string) string {
 	if env == "" {
 		return ""
@@ -79,6 +90,7 @@ type Common struct {
 	Chrome            string
 	CDPURL            string // attach to a running Chrome instead of launching one
 	Profile           string // Chrome profile directory to reuse (default: a throwaway one)
+	RealPage          bool   // load the real play page instead of a stub with only the Turnstile widget
 	TurnstileTimeoutS int
 	Connections       int
 	NetworkProbes     int
@@ -89,6 +101,7 @@ func (c *Common) Register(f *Flags) {
 	f.String(&c.Chrome, "chrome", "QUIZ_SC_CHROME", "chromium", "Chrome binary")
 	f.String(&c.CDPURL, "cdp-url", "QUIZ_SC_CDP_URL", "", "attach to a running Chrome instead of launching one")
 	f.String(&c.Profile, "profile", "QUIZ_SC_PROFILE", "", "Chrome profile directory to reuse (default: a throwaway one)")
+	f.Bool(&c.RealPage, "real-page", "QUIZ_SC_REAL_PAGE", false, "load the real play page instead of a stub with only the Turnstile widget (slower)")
 	f.Int(&c.TurnstileTimeoutS, "turnstile-timeout-s", "QUIZ_SC_TURNSTILE_TIMEOUT_S", 60, "Turnstile timeout in seconds")
 	f.Int(&c.Connections, "connections", "QUIZ_SC_CONNECTIONS", 2, "independent routes used by bench only; races always use two")
 	f.Int(&c.NetworkProbes, "network-probes", "QUIZ_SC_NETWORK_PROBES", 3, "fresh curl connection probes for bench (0 disables; requires curl >= 7.83)")
@@ -109,6 +122,8 @@ type RaceArgs struct {
 	MaxRequests    int
 	RunsDir        string
 	TurnstileToken string // use this token instead of getting one from Chrome
+	AbortAfter     int    // abort once this many answers are in if they took longer than AbortMs (0: never)
+	AbortMs        int
 }
 
 func (r *RaceArgs) Register(f *Flags) {
@@ -118,6 +133,8 @@ func (r *RaceArgs) Register(f *Flags) {
 	f.String(&r.Locale, "locale", "QUIZ_SC_LOCALE", "fr", "question locale")
 	f.Int(&r.HedgeMs, "hedge-ms", "QUIZ_SC_HEDGE_MS", 150, "send a duplicate answer on the other connection after this long")
 	f.Int(&r.MaxRequests, "max-requests", "QUIZ_SC_MAX_REQUESTS", 4, "requests per answer, duplicates and retries included")
+	f.Int(&r.AbortAfter, "abort-after", "QUIZ_SC_ABORT_AFTER", 0, "abort a race once this many answers are in if they took longer than --abort-ms (0: never)")
+	f.Int(&r.AbortMs, "abort-ms", "QUIZ_SC_ABORT_MS", 1500, "see --abort-after")
 	f.String(&r.RunsDir, "runs-dir", "QUIZ_SC_RUNS_DIR", "runs", "where race logs go")
 	f.String(&r.TurnstileToken, "turnstile-token", "QUIZ_SC_TURNSTILE_TOKEN", "", "use this Turnstile token instead of getting one from Chrome")
 }
@@ -130,7 +147,7 @@ func (r *RaceArgs) Validate(f *Flags) {
 
 func credentials(ctx context.Context, common *Common) (*browser.Credentials, error) {
 	started := time.Now()
-	c, err := browser.Get(ctx, common.Chrome, common.CDPURL, common.Profile, common.URL,
+	c, err := browser.Get(ctx, common.Chrome, common.CDPURL, common.Profile, common.URL, !common.RealPage,
 		time.Duration(common.TurnstileTimeoutS)*time.Second)
 	if err != nil {
 		return nil, err
@@ -289,6 +306,8 @@ func RunRace(ctx context.Context, args *RaceArgs) error {
 		HedgeAfter:  time.Duration(args.HedgeMs) * time.Millisecond,
 		MaxRequests: max(args.MaxRequests, 1),
 		RunsDir:     args.RunsDir,
+		AbortAfter:  args.AbortAfter,
+		AbortLimit:  time.Duration(args.AbortMs) * time.Millisecond,
 	}
 	return race.Race(ctx, session, config, token, llm.FromEnv())
 }

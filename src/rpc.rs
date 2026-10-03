@@ -159,9 +159,12 @@ impl Rpc {
         if let Some(ip) = edge {
             builder = builder.resolve("superchallenge.io", SocketAddr::new(ip, 443));
         }
+        // An empty user agent sends none (the bare answers).
+        if !user_agent.is_empty() {
+            builder = builder.user_agent(user_agent);
+        }
         let client = builder
             .no_proxy()
-            .user_agent(user_agent)
             .default_headers(headers)
             .tcp_nodelay(true)
             .pool_idle_timeout(Duration::from_secs(600))

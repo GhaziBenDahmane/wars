@@ -95,6 +95,8 @@ private:
 struct Common {
     std::string url, chrome;
     std::optional<std::string> cdp_url, profile;
+    /// Load the real play page instead of a stub with only the Turnstile widget.
+    bool real_page;
     uint64_t turnstile_timeout_s, connections, network_probes;
 
     explicit Common(Args& a)
@@ -102,6 +104,7 @@ struct Common {
           chrome(a.text("chrome", "QUIZ_SC_CHROME", "chromium")),
           cdp_url(a.optional_text("cdp-url", "QUIZ_SC_CDP_URL")),
           profile(a.optional_text("profile", "QUIZ_SC_PROFILE")),
+          real_page(a.optional_text("real-page", "QUIZ_SC_REAL_PAGE").value_or("false") == "true"),
           turnstile_timeout_s(a.number("turnstile-timeout-s", "QUIZ_SC_TURNSTILE_TIMEOUT_S", 60, 1, 3600)),
           connections(a.number("connections", "QUIZ_SC_CONNECTIONS", 2, 2, 16)),
           network_probes(a.number("network-probes", "QUIZ_SC_NETWORK_PROBES", 3, 0, 10)) {}
@@ -111,7 +114,7 @@ struct RaceArgs {
     Common common;
     std::optional<std::string> email, nickname, turnstile_token;
     std::string locale, runs_dir;
-    uint64_t hedge_ms, max_requests;
+    uint64_t hedge_ms, max_requests, abort_after, abort_ms;
 
     explicit RaceArgs(Args& a)
         : common(a),
@@ -121,12 +124,14 @@ struct RaceArgs {
           locale(a.text("locale", "QUIZ_SC_LOCALE", "fr")),
           runs_dir(a.text("runs-dir", "QUIZ_SC_RUNS_DIR", "runs")),
           hedge_ms(a.number("hedge-ms", "QUIZ_SC_HEDGE_MS", 150, 0, 60000)),
-          max_requests(a.number("max-requests", "QUIZ_SC_MAX_REQUESTS", 4, 0, 64)) {}
+          max_requests(a.number("max-requests", "QUIZ_SC_MAX_REQUESTS", 4, 0, 64)),
+          abort_after(a.number("abort-after", "QUIZ_SC_ABORT_AFTER", 0, 0, 200)),
+          abort_ms(a.number("abort-ms", "QUIZ_SC_ABORT_MS", 1500, 0, 600000)) {}
 };
 
 browser::Credentials credentials(const Common& common) {
     auto started = Clock::now();
-    auto c = browser::credentials(common.chrome, common.cdp_url, common.profile, common.url,
+    auto c = browser::credentials(common.chrome, common.cdp_url, common.profile, common.url, !common.real_page,
                                   std::chrono::seconds(common.turnstile_timeout_s));
     say(format("turnstile token in %.1fs (%zu chars, %zu cookie bytes)",
                std::chrono::duration<double>(Clock::now() - started).count(), c.turnstile_token.size(),
@@ -272,7 +277,9 @@ void run_race(const RaceArgs& args) {
                         args.locale,
                         std::chrono::milliseconds(args.hedge_ms),
                         std::max<size_t>(args.max_requests, 1),
-                        args.runs_dir};
+                        args.runs_dir,
+                        args.abort_after,
+                        std::chrono::milliseconds(args.abort_ms)};
     race::race(session, config, token, llm.get());
 }
 

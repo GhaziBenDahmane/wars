@@ -6,6 +6,7 @@ package browser
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,12 +48,22 @@ new Promise((resolve, reject) => {
   };
   setTimeout(() => reject(new Error('turnstile timeout')), TIMEOUT_MS);
   if (window.turnstile) return render();
-  const script = document.createElement('script');
-  script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-  script.onload = render;
-  document.head.appendChild(script);
+  let script = document.querySelector('script[src*="challenges.cloudflare.com/turnstile"]');
+  if (!script) {
+    script = document.createElement('script');
+    script.src = TURNSTILE_SRC;
+    document.head.appendChild(script);
+  }
+  script.addEventListener('load', render);
 })
 `
+
+const turnstileSrc = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
+
+// stubPage is served in place of the play page (the Turnstile solvers'
+// trick): the widget runs on the real origin without loading the site, and
+// its script starts downloading with the first byte.
+const stubPage = `<!doctype html><html><head><script src="` + turnstileSrc + `" async></script></head><body></body></html>`
 
 type Credentials struct {
 	TurnstileToken string
@@ -63,6 +74,8 @@ type Credentials struct {
 type cdp struct {
 	socket *websocket.Conn
 	nextID int64
+	// stub answers every paused request (see `Fetch.enable`) when set.
+	stub string
 }
 
 func (c *cdp) send(ctx context.Context, method string, params any) (json.RawMessage, error) {
@@ -85,11 +98,28 @@ func (c *cdp) send(ctx context.Context, method string, params any) (json.RawMess
 		}
 		var reply struct {
 			ID     *int64          `json:"id"`
+			Method string          `json:"method"`
 			Error  json.RawMessage `json:"error"`
 			Result json.RawMessage `json:"result"`
+			Params struct {
+				RequestID string `json:"requestId"`
+			} `json:"params"`
 		}
 		if err := json.Unmarshal(frame, &reply); err != nil {
 			return nil, err
+		}
+		if reply.Method == "Fetch.requestPaused" && c.stub != "" {
+			c.nextID++ // its reply is skipped below
+			fulfill, _ := json.Marshal(map[string]any{"id": c.nextID, "method": "Fetch.fulfillRequest", "params": map[string]any{
+				"requestId":       reply.Params.RequestID,
+				"responseCode":    200,
+				"responseHeaders": []map[string]string{{"name": "content-type", "value": "text/html; charset=utf-8"}},
+				"body":            base64.StdEncoding.EncodeToString([]byte(c.stub)),
+			}})
+			if err := c.socket.Write(ctx, websocket.MessageText, fulfill); err != nil {
+				return nil, err
+			}
+			continue
 		}
 		if reply.ID == nil || *reply.ID != id {
 			continue // an event
@@ -160,7 +190,7 @@ func (c *cdp) settle(ctx context.Context, settle time.Duration) error {
 				stableSince = time.Time{}
 			}
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 	return fmt.Errorf("the play page did not finish loading (last: %s)", last)
 }
@@ -252,7 +282,7 @@ func freePort() (int, error) {
 
 // Get launches (or attaches to `cdpURL`) Chrome, opens the play page and gets
 // a token.
-func Get(ctx context.Context, chrome, cdpURL, profile, playURL string, timeout time.Duration) (*Credentials, error) {
+func Get(ctx context.Context, chrome, cdpURL, profile, playURL string, stub bool, timeout time.Duration) (*Credentials, error) {
 	port, err := freePort()
 	if err != nil {
 		return nil, err
@@ -320,17 +350,32 @@ func Get(ctx context.Context, chrome, cdpURL, profile, playURL string, timeout t
 	socket.SetReadLimit(64 << 20)
 	defer socket.CloseNow()
 	c := &cdp{socket: socket}
+	if stub {
+		c.stub = stubPage
+	}
 	if _, err := c.send(ctx, "Network.enable", map[string]any{}); err != nil {
 		return nil, err
+	}
+	if stub {
+		pattern := []map[string]string{{"urlPattern": playURL, "resourceType": "Document"}}
+		if _, err := c.send(ctx, "Fetch.enable", map[string]any{"patterns": pattern}); err != nil {
+			return nil, err
+		}
 	}
 	if _, err := c.send(ctx, "Page.navigate", map[string]any{"url": playURL}); err != nil {
 		return nil, err
 	}
-	if err := c.settle(ctx, 1500*time.Millisecond); err != nil {
+	// The real page redirects and hydrates; the stub is ready once loaded.
+	settle := 1500 * time.Millisecond
+	if stub {
+		settle = 0
+	}
+	if err := c.settle(ctx, settle); err != nil {
 		return nil, err
 	}
 	siteKey, _ := json.Marshal(TurnstileSiteKey)
-	script := strings.NewReplacer("SITE_KEY", string(siteKey),
+	src, _ := json.Marshal(turnstileSrc)
+	script := strings.NewReplacer("SITE_KEY", string(siteKey), "TURNSTILE_SRC", string(src),
 		"TIMEOUT_MS", strconv.FormatInt(timeout.Milliseconds(), 10)).Replace(turnstileJS)
 	token, err := c.evaluate(ctx, script)
 	if err != nil {

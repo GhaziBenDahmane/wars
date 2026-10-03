@@ -28,6 +28,11 @@ struct Config {
     http::Duration hedge_after;
     size_t max_requests;
     std::string runs_dir;
+    /// When positive: give up a race whose first `abort_after` answers took
+    /// longer than `abort_limit`. It will not be a best time, and the next
+    /// race starts sooner.
+    size_t abort_after = 0;
+    http::Duration abort_limit{};
 };
 
 class Session {

@@ -33,12 +33,32 @@ pub struct Config {
     pub follow_winner: bool,
     /// What this race tries (hedge, edge, protocol...), written to its log.
     pub variant: Value,
+    /// Give up a race whose first answers are slow: it will not be a best
+    /// time, and the next race starts sooner.
+    pub abort: Option<Abort>,
     pub runs_dir: PathBuf,
+}
+
+/// Abort when the first `after` answers took longer than `limit` in total.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Abort {
+    pub after: usize,
+    pub limit: Duration,
+}
+
+impl Abort {
+    /// With `answered` correct answers `taken` after the start reply.
+    fn now(&self, answered: usize, taken: Duration) -> bool {
+        answered == self.after && taken > self.limit
+    }
 }
 
 pub struct Session {
     pub routes: Vec<Rpc>,
     pub base: Value,
+    /// Starts the run and saves the score instead of `routes[0]`, when the
+    /// answers go without the browser headers.
+    pub starter: Option<Rpc>,
 }
 
 /// `/play/SUPERCHALLENGE-JAWVUX` -> `JAWVUX` (the slug is cosmetic).
@@ -143,6 +163,7 @@ impl Session {
         Ok(Self {
             routes,
             base: json!({ "productId": rpc::PRODUCT_ID, "code": code }),
+            starter: None,
         })
     }
 
@@ -283,8 +304,10 @@ pub async fn race(
         crate::say!("{STARTING_RUN}");
         let race_started = Instant::now();
         // Never duplicated: a second startRunV2 could spend a second attempt.
-        let start = session.routes[0].call("startRunV2", &start_input).await?;
+        let starter = session.starter.as_ref().unwrap_or(&session.routes[0]);
+        let start = starter.call("startRunV2", &start_input).await?;
         let mut received = Instant::now();
+        let start_received = received;
         log.write("start", json!({ "response": start, "variant": config.variant }));
         let run_token = start["runToken"]
             .as_str()
@@ -297,6 +320,7 @@ pub async fn race(
         let mut summary = Vec::with_capacity(256);
         let mut routes = session.routes.clone();
         let mut swaps = 0;
+        let mut aborted = false;
         let ended = loop {
             let Some(drill) = queue.get(answered).cloned() else {
                 break "no drill left".to_string();
@@ -400,6 +424,16 @@ pub async fn race(
                 break format!("{} (score {})", response["ended"], response["runningScore"]);
             }
             answered += 1;
+            if let Some(abort) = config.abort
+                && abort.now(answered, received - start_received)
+            {
+                aborted = true;
+                break format!(
+                    "aborted: the first {answered} answers took {} ms (limit {} ms)",
+                    (received - start_received).as_millis(),
+                    abort.limit.as_millis()
+                );
+            }
             for next in find_drills(&response) {
                 if !queue.iter().any(|d| d["id"] == next["id"]) {
                     queue.push(next);
@@ -412,12 +446,14 @@ pub async fn race(
             elapsed.as_secs_f64()
         );
         print_summary(&summary);
-        if let Some(nickname) = config.nickname.as_deref().filter(|n| !n.is_empty()) {
+        if aborted {
+            crate::say!("aborted: score not submitted");
+        } else if let Some(nickname) = config.nickname.as_deref().filter(|n| !n.is_empty()) {
             let mut input = base.clone();
             input["runToken"] = json!(run_token);
             input["email"] = json!(config.email);
             input["nickname"] = json!(nickname);
-            let saved = session.routes[0].call("submitScoreV2", &input).await?;
+            let saved = starter.call("submitScoreV2", &input).await?;
             crate::say!("score saved: {saved}");
             log.write("score", json!({ "response": saved }));
         } else {
@@ -543,8 +579,101 @@ mod tests {
                 .map(|index| Rpc::with_origin(&origin, &index.to_string(), None).unwrap())
                 .collect(),
             base: json!({"code": "test"}),
+            starter: None,
         };
         (session, state, server)
+    }
+
+    /// A competition of `drills` questions, each answered after `delay`;
+    /// records the procedures called and the user agent of each answer.
+    async fn race_server(
+        drills: usize,
+        delay: Duration,
+    ) -> (String, Arc<Mutex<Vec<(String, Option<String>)>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let drill = |index: usize| {
+            json!({ "id": format!("gen-{index}"),
+                    "patternData": { "prompt": "TASK: compute (1 + 1) mod 7 | ANSWER: digits only" } })
+        };
+        let seen = calls.clone();
+        let router = Router::new().route(
+            "/api/rpc/superchallenge/{procedure}",
+            post(move |Path(procedure): Path<String>, headers: HeaderMap, Json(body): Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    let agent = headers.get("user-agent").map(|v| v.to_str().unwrap().to_string());
+                    seen.lock().unwrap().push((procedure.clone(), agent));
+                    let reply = match procedure.as_str() {
+                        "startRunV2" => json!({ "runToken": "token", "drills": [drill(0)],
+                            "setup": { "agentWars": { "questionDeadlineSec": 2 } } }),
+                        "submitAnswerV2" => {
+                            tokio::time::sleep(delay).await;
+                            let index: usize = body["json"]["drillId"].as_str().unwrap()[4..].parse().unwrap();
+                            let last = index + 1 == drills;
+                            json!({ "isCorrect": body["json"]["submission"] == "2",
+                                    "runningScore": (index + 1) * 5000,
+                                    "ended": if last { json!("goal") } else { Value::Null },
+                                    "next": if last { Value::Null } else { drill(index + 1) } })
+                        }
+                        _ => json!({ "agentWars": { "ended": "goal" } }),
+                    };
+                    Json(json!({ "json": reply }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (origin, calls)
+    }
+
+    fn race_config(abort: Option<Abort>) -> Config {
+        Config {
+            code: "test".into(),
+            email: "a@b.c".into(),
+            nickname: Some("team".into()),
+            locale: "fr".into(),
+            hedge_after: Duration::from_secs(5),
+            max_requests: 1,
+            follow_winner: false,
+            variant: json!({}),
+            abort,
+            runs_dir: std::env::temp_dir().join(format!("agentwars-race-{}", std::process::id())),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_start_aborts_the_race_without_saving_the_score() {
+        let (origin, calls) = race_server(50, Duration::from_millis(10)).await;
+        let session = Session {
+            routes: (0..2).map(|_| Rpc::with_origin(&origin, "", None).unwrap()).collect(),
+            base: json!({"code": "test"}),
+            starter: Some(Rpc::with_origin(&origin, "Chrome/1", None).unwrap()),
+        };
+        let abort = Abort { after: 5, limit: Duration::from_millis(20) };
+        race(&session, &race_config(Some(abort)), "turnstile", None).await.unwrap();
+        let calls = calls.lock().unwrap().clone();
+        let answers: Vec<_> = calls.iter().filter(|(p, _)| p == "submitAnswerV2").collect();
+        assert_eq!(answers.len(), 5, "{calls:?}");
+        assert!(!calls.iter().any(|(p, _)| p == "submitScoreV2"));
+        // Started with the browser's user agent, answered bare.
+        assert_eq!(calls[0], ("startRunV2".into(), Some("Chrome/1".into())));
+        assert!(answers.iter().all(|(_, agent)| agent.is_none()), "{answers:?}");
+    }
+
+    #[tokio::test]
+    async fn a_fast_start_races_to_the_goal_and_saves_the_score() {
+        let (origin, calls) = race_server(50, Duration::ZERO).await;
+        let session = Session {
+            routes: (0..2).map(|_| Rpc::with_origin(&origin, "Chrome/1", None).unwrap()).collect(),
+            base: json!({"code": "test"}),
+            starter: None,
+        };
+        let abort = Abort { after: 5, limit: Duration::from_secs(5) };
+        race(&session, &race_config(Some(abort)), "turnstile", None).await.unwrap();
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.iter().filter(|(p, _)| p == "submitAnswerV2").count(), 50);
+        assert_eq!(calls.last().unwrap().0, "submitScoreV2");
     }
 
     #[test]
