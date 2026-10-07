@@ -1,0 +1,10 @@
+/target
+/runs
+.env
+.env.local
+*.pem
+team*.csv
+/cpp/build
+*:Zone.Identifier
+AGENTS.md
+/.claude

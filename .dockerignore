@@ -1,0 +1,8 @@
+/target
+/runs
+/cpp/build
+.env
+*.pem
+*:Zone.Identifier
+.env.local
+AGENTS.md
